@@ -7249,6 +7249,44 @@ def _worker_terminal_timeout_env(
     return str(desired)
 
 
+def _resolve_kanban_worker_model(task: Task) -> Optional[str]:
+    """Return the model override to pass to a dispatched Kanban worker.
+
+    Operator policy (2026-06-25): complex/uncategorized Kanban cards stay on
+    GPT 5.5. Orchestrators may mark cards they judge simple enough for Spark by
+    setting ``model_override`` to the configured ``simple_model``
+    (``gpt-5.3-codex-spark``). Spark-marked cards escalate to GPT 5.5 on the
+    third attempt and later. Other explicit per-card model overrides remain
+    strongest and are honoured as deliberate choices.
+
+    ``consecutive_failures`` is incremented after a failed attempt and reset on
+    successful completion, so ``2`` means the next dispatch is the third try.
+    """
+    cfg = {}
+    try:
+        from hermes_cli.config import load_config
+        cfg = ((load_config().get("kanban") or {}).get("worker_model_policy") or {})
+    except Exception:
+        cfg = {}
+
+    default_model = str(cfg.get("default_model") or "gpt-5.5").strip()
+    simple_model = str(cfg.get("simple_model") or "gpt-5.3-codex-spark").strip()
+    escalation_model = str(cfg.get("third_attempt_model") or "gpt-5.5").strip()
+    try:
+        third_attempt_after_failures = int(cfg.get("third_attempt_after_failures", 2))
+    except (TypeError, ValueError):
+        third_attempt_after_failures = 2
+
+    failures = task.consecutive_failures or 0
+    if task.model_override:
+        override = str(task.model_override).strip()
+        if override == simple_model and failures >= max(0, third_attempt_after_failures):
+            return escalation_model or default_model or simple_model or None
+        return override or None
+
+    return default_model or None
+
+
 def _resolve_worker_cli_toolsets(hermes_home: Optional[str]) -> Optional[list[str]]:
     """Return the assigned profile's effective CLI toolsets for a worker.
 
@@ -7410,8 +7448,10 @@ def _default_spawn(
         for sk in task.skills:
             if sk:
                 cmd.extend(["--skills", sk])
-    if task.model_override:
-        cmd.extend(["-m", task.model_override])
+    effective_model = _resolve_kanban_worker_model(task)
+    if effective_model:
+        cmd.extend(["-m", effective_model])
+        env["HERMES_KANBAN_WORKER_MODEL"] = effective_model
     worker_toolsets = _resolve_worker_cli_toolsets(env.get("HERMES_HOME"))
     if worker_toolsets:
         cmd.extend(["--toolsets", ",".join(worker_toolsets)])
