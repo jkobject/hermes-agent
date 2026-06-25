@@ -3596,9 +3596,12 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
             _resolve_prefill_messages_file(CLI_CONFIG)
         )
         
-        # Reasoning config (OpenRouter reasoning effort level)
+        # Reasoning config (OpenRouter reasoning effort level). Kanban worker
+        # subprocesses can pin a per-card effort without mutating profile/global
+        # config via HERMES_KANBAN_REASONING_EFFORT.
+        _kanban_reasoning_effort = os.getenv("HERMES_KANBAN_REASONING_EFFORT", "").strip()
         self.reasoning_config = _parse_reasoning_config(
-            CLI_CONFIG["agent"].get("reasoning_effort", "")
+            _kanban_reasoning_effort or CLI_CONFIG["agent"].get("reasoning_effort", "")
         )
         self.service_tier = _parse_service_tier_config(
             CLI_CONFIG["agent"].get("service_tier", "")

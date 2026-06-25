@@ -7249,6 +7249,56 @@ def _worker_terminal_timeout_env(
     return str(desired)
 
 
+_REASONING_EFFORT_ORDER = ("none", "low", "medium", "high")
+_REASONING_EFFORT_RE = re.compile(
+    r"(?im)^\s*(?:kanban_)?(?:reasoning_effort|thinking_budget|reasoning_budget)\s*[:=]\s*"
+    r"(none|low|medium|high)\b"
+)
+
+
+def _resolve_kanban_worker_reasoning_effort(task: Task) -> Optional[str]:
+    """Return worker reasoning effort for a dispatched Kanban task.
+
+    Operator policy (2026-06-25): orchestrators/reviewers should choose a
+    thinking budget per card by writing e.g. ``reasoning_effort: low`` or
+    ``thinking_budget: high`` in the card body. Complex/uncategorized work uses
+    the configured default. Each true failed attempt increments the budget one
+    notch (``consecutive_failures``), while review-requested mini-updates should
+    be routed as normal fix/update cards with the right explicit budget rather
+    than counted as worker failure.
+    """
+    cfg = {}
+    try:
+        from hermes_cli.config import load_config
+        cfg = ((load_config().get("kanban") or {}).get("worker_reasoning_policy") or {})
+    except Exception:
+        cfg = {}
+
+    default_effort = str(cfg.get("default_effort") or "medium").strip().lower()
+    max_effort = str(cfg.get("max_effort") or "high").strip().lower()
+    if default_effort not in _REASONING_EFFORT_ORDER:
+        default_effort = "medium"
+    if max_effort not in _REASONING_EFFORT_ORDER:
+        max_effort = "high"
+
+    base_effort = default_effort
+    body = task.body or ""
+    match = _REASONING_EFFORT_RE.search(body)
+    if match:
+        base_effort = match.group(1).strip().lower()
+
+    try:
+        failures = max(0, int(task.consecutive_failures or 0))
+    except (TypeError, ValueError):
+        failures = 0
+
+    base_idx = _REASONING_EFFORT_ORDER.index(base_effort)
+    max_idx = _REASONING_EFFORT_ORDER.index(max_effort)
+    # Escalate one notch for each genuine failed attempt, capped by max_effort.
+    idx = min(max_idx, base_idx + failures)
+    return _REASONING_EFFORT_ORDER[idx]
+
+
 def _resolve_kanban_worker_model(task: Task) -> Optional[str]:
     """Return the model override to pass to a dispatched Kanban worker.
 
@@ -7284,6 +7334,12 @@ def _resolve_kanban_worker_model(task: Task) -> Optional[str]:
             return escalation_model or default_model or simple_model or None
         return override or None
 
+    # Complexity-coupled default: cards explicitly judged low-complexity run on
+    # Spark; medium/high/default cards stay on GPT-5.5. Because reasoning effort
+    # escalates after genuine failures, a low card that fails moves to medium and
+    # therefore returns to GPT-5.5 automatically.
+    if _resolve_kanban_worker_reasoning_effort(task) == "low":
+        return simple_model or default_model or None
     return default_model or None
 
 
@@ -7452,6 +7508,9 @@ def _default_spawn(
     if effective_model:
         cmd.extend(["-m", effective_model])
         env["HERMES_KANBAN_WORKER_MODEL"] = effective_model
+    effective_reasoning = _resolve_kanban_worker_reasoning_effort(task)
+    if effective_reasoning:
+        env["HERMES_KANBAN_REASONING_EFFORT"] = effective_reasoning
     worker_toolsets = _resolve_worker_cli_toolsets(env.get("HERMES_HOME"))
     if worker_toolsets:
         cmd.extend(["--toolsets", ",".join(worker_toolsets)])
