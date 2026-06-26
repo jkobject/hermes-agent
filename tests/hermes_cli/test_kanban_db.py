@@ -3444,6 +3444,109 @@ def _make_task(**overrides) -> "kb.Task":
     return kb.Task(**defaults)
 
 
+# ---------------------------------------------------------------------------
+# Kanban worker model + reasoning policy
+# ---------------------------------------------------------------------------
+
+
+def test_worker_reasoning_and_model_policy_matrix(monkeypatch):
+    """Kanban worker retries should follow the explicit cost policy matrix."""
+    from hermes_cli import config as hermes_config
+
+    monkeypatch.setattr(
+        hermes_config,
+        "load_config",
+        lambda: {
+            "kanban": {
+                "worker_model_policy": {
+                    "default_model": "gpt-5.5",
+                    "simple_model": "gpt-5.3-codex-spark",
+                    "third_attempt_model": "gpt-5.5",
+                    "third_attempt_after_failures": 2,
+                },
+                "worker_reasoning_policy": {
+                    "default_effort": "medium",
+                    "max_effort": "high",
+                },
+            }
+        },
+    )
+
+    cases = [
+        ("low", 0, "medium", "gpt-5.3-codex-spark"),
+        ("low", 1, "low", "gpt-5.5"),
+        ("low", 2, "medium", "gpt-5.5"),
+        ("medium", 0, "low", "gpt-5.5"),
+        ("medium", 1, "low", "gpt-5.5"),
+        ("medium", 2, "medium", "gpt-5.5"),
+        ("high", 0, "medium", "gpt-5.5"),
+        ("high", 1, "medium", "gpt-5.5"),
+        ("high", 2, "high", "gpt-5.5"),
+    ]
+
+    for base_effort, failures, expected_effort, expected_model in cases:
+        task = _make_task(
+            body=f"reasoning_effort: {base_effort}",
+            consecutive_failures=failures,
+        )
+        assert kb._resolve_kanban_worker_reasoning_effort(task) == expected_effort
+        assert kb._resolve_kanban_worker_model(task) == expected_model
+
+
+def test_low_card_first_attempt_falls_back_to_gpt55_low_when_spark_disabled(monkeypatch):
+    """If Spark is not configured, a low card should not spend medium thinking."""
+    from hermes_cli import config as hermes_config
+
+    monkeypatch.setattr(
+        hermes_config,
+        "load_config",
+        lambda: {
+            "kanban": {
+                "worker_model_policy": {
+                    "default_model": "gpt-5.5",
+                    "simple_model": "",
+                },
+                "worker_reasoning_policy": {
+                    "default_effort": "medium",
+                    "max_effort": "high",
+                },
+            }
+        },
+    )
+
+    task = _make_task(body="thinking_budget: low", consecutive_failures=0)
+
+    assert kb._resolve_kanban_worker_reasoning_effort(task) == "low"
+    assert kb._resolve_kanban_worker_model(task) == "gpt-5.5"
+
+
+def test_default_unmarked_card_uses_medium_policy_without_spark(monkeypatch):
+    """Unmarked cards default to medium policy: low reasoning on GPT-5.5."""
+    from hermes_cli import config as hermes_config
+
+    monkeypatch.setattr(
+        hermes_config,
+        "load_config",
+        lambda: {
+            "kanban": {
+                "worker_model_policy": {
+                    "default_model": "gpt-5.5",
+                    "simple_model": "gpt-5.3-codex-spark",
+                },
+                "worker_reasoning_policy": {
+                    "default_effort": "medium",
+                    "max_effort": "high",
+                },
+            }
+        },
+    )
+
+    task = _make_task(body="ordinary card", consecutive_failures=0)
+
+    assert kb._resolve_kanban_worker_reasoning_effort(task) == "low"
+    assert kb._resolve_kanban_worker_model(task) == "gpt-5.5"
+
+
 def test_safe_int_accepts_int_and_int_string():
     """Sanity: well-typed values pass through."""
     # PR d8ad431de renamed _safe_int → _to_epoch (now also handles ISO-8601).

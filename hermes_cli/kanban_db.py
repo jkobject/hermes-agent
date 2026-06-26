@@ -7565,9 +7565,14 @@ def _resolve_kanban_worker_reasoning_effort(task: Task) -> Optional[str]:
     than counted as worker failure.
     """
     cfg = {}
+    simple_model_available = True
     try:
         from hermes_cli.config import load_config
-        cfg = ((load_config().get("kanban") or {}).get("worker_reasoning_policy") or {})
+        kanban_cfg = load_config().get("kanban") or {}
+        cfg = (kanban_cfg.get("worker_reasoning_policy") or {})
+        model_cfg = kanban_cfg.get("worker_model_policy") or {}
+        raw_simple_model = model_cfg.get("simple_model", "gpt-5.3-codex-spark")
+        simple_model_available = bool(str(raw_simple_model or "").strip())
     except Exception:
         cfg = {}
 
@@ -7589,11 +7594,27 @@ def _resolve_kanban_worker_reasoning_effort(task: Task) -> Optional[str]:
     except (TypeError, ValueError):
         failures = 0
 
-    base_idx = _REASONING_EFFORT_ORDER.index(base_effort)
+    # Kanban worker budget policy is intentionally a matrix, not a simple
+    # monotonic "+1 notch per failure" escalation.  Cheap/simple cards get a
+    # medium Spark attempt first, then fall back to cheaper GPT-5.5 attempts;
+    # medium/high cards start one notch below their requested budget and only
+    # climb after repeated genuine worker failures.
+    if base_effort == "low":
+        if failures == 0:
+            resolved = "medium" if simple_model_available else "low"
+        else:
+            resolved = "low" if failures == 1 else "medium"
+    elif base_effort == "medium":
+        resolved = "low" if failures < 2 else "medium"
+    elif base_effort == "high":
+        resolved = "medium" if failures < 2 else "high"
+    else:
+        base_idx = _REASONING_EFFORT_ORDER.index(base_effort)
+        resolved = _REASONING_EFFORT_ORDER[min(len(_REASONING_EFFORT_ORDER) - 1, base_idx + failures)]
+
     max_idx = _REASONING_EFFORT_ORDER.index(max_effort)
-    # Escalate one notch for each genuine failed attempt, capped by max_effort.
-    idx = min(max_idx, base_idx + failures)
-    return _REASONING_EFFORT_ORDER[idx]
+    resolved_idx = _REASONING_EFFORT_ORDER.index(resolved)
+    return _REASONING_EFFORT_ORDER[min(max_idx, resolved_idx)]
 
 
 def _resolve_kanban_worker_model(task: Task) -> Optional[str]:
@@ -7617,7 +7638,8 @@ def _resolve_kanban_worker_model(task: Task) -> Optional[str]:
         cfg = {}
 
     default_model = str(cfg.get("default_model") or "gpt-5.5").strip()
-    simple_model = str(cfg.get("simple_model") or "gpt-5.3-codex-spark").strip()
+    raw_simple_model = cfg.get("simple_model", "gpt-5.3-codex-spark")
+    simple_model = str(raw_simple_model or "").strip()
     escalation_model = str(cfg.get("third_attempt_model") or "gpt-5.5").strip()
     try:
         third_attempt_after_failures = int(cfg.get("third_attempt_after_failures", 2))
@@ -7631,11 +7653,19 @@ def _resolve_kanban_worker_model(task: Task) -> Optional[str]:
             return escalation_model or default_model or simple_model or None
         return override or None
 
-    # Complexity-coupled default: cards explicitly judged low-complexity run on
-    # Spark; medium/high/default cards stay on GPT-5.5. Because reasoning effort
-    # escalates after genuine failures, a low card that fails moves to medium and
-    # therefore returns to GPT-5.5 automatically.
-    if _resolve_kanban_worker_reasoning_effort(task) == "low":
+    # Complexity-coupled default: only cards explicitly marked low get a cheap
+    # Spark first attempt.  Once a low card has genuinely failed, or for any
+    # medium/high/default card, dispatch on GPT-5.5 and let the reasoning matrix
+    # above control the thinking budget.  Do not silently fall back to DeepSeek:
+    # bad cheap retries are more expensive than a correct 5.5 retry.
+    body = task.body or ""
+    match = _REASONING_EFFORT_RE.search(body)
+    base_effort = match.group(1).strip().lower() if match else None
+    try:
+        failures = max(0, int(task.consecutive_failures or 0))
+    except (TypeError, ValueError):
+        failures = 0
+    if base_effort == "low" and failures == 0:
         return simple_model or default_model or None
     return default_model or None
 

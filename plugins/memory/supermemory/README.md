@@ -35,12 +35,14 @@ Config file: `$HERMES_HOME/supermemory.json`
 | `search_mode` | `hybrid` | Search mode: `hybrid` (profile + memories), `memories` (memories only), `documents` (documents only) |
 | `entity_context` | built-in default | Extraction guidance passed to Supermemory |
 | `api_timeout` | `5.0` | Timeout for SDK and ingest requests |
+| `api_url` | `https://api.supermemory.ai` | Supermemory API base URL. Set to `http://localhost:6767` for `supermemory local`. |
 
 ### Environment Variables
 
 | Variable | Description |
 |----------|-------------|
 | `SUPERMEMORY_API_KEY` | API key (required) |
+| `SUPERMEMORY_API_URL` | Override API base URL (e.g. `http://localhost:6767` for local) |
 | `SUPERMEMORY_CONTAINER_TAG` | Override container tag (takes priority over config file) |
 
 ## Tools

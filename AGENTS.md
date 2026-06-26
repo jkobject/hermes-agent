@@ -1077,6 +1077,14 @@ kanban task.
   stale claims, promotes ready tasks, atomically claims, and spawns
   assigned profiles. Runs **inside the gateway** by default via
   `kanban.dispatch_in_gateway: true`.
+- **Orchestration invariant:** when a board looks idle (`running=0`,
+  `ready=0`) or a worker wave just finished, diagnose transitions before
+  calling the work done. Look for blocked producers with `review-required`,
+  check whether ungated reviewer cards already approved them, close accepted
+  producers administratively when appropriate, promote/dispatch their
+  children, then create the next concrete card if the user's scope is not
+  actually finished. An empty ready queue is not convergence; it is often a
+  missed `review → close producer → promote children → next wave` transition.
 - **Plugin assets:** `plugins/kanban/dashboard/` (web UI) +
   `plugins/kanban/systemd/` (`hermes-kanban-dispatcher.service` for
   standalone dispatcher deployment).
