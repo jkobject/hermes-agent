@@ -32,7 +32,6 @@ _DEFAULT_API_TIMEOUT = 5.0
 _DEFAULT_API_URL = "https://api.supermemory.ai"
 _MIN_CAPTURE_LENGTH = 10
 _MAX_ENTITY_CONTEXT_LENGTH = 1500
-_DEFAULT_API_URL = "https://api.supermemory.ai"
 _API_KEY_URL = "https://supermemory.ai"
 _TRIVIAL_RE = re.compile(
     r"^(ok|okay|thanks|thank you|got it|sure|yes|no|yep|nope|k|ty|thx|np)\.?$",
@@ -74,7 +73,7 @@ def _default_config() -> dict:
 
 
 def _sanitize_tag(raw: str) -> str:
-    tag = re.sub(r"[^a-zA-Z0-9_-]", "_", raw or "")
+    tag = re.sub(r"[^a-zA-Z0-9_]", "_", raw or "")
     tag = re.sub(r"_+", "_", tag)
     return tag.strip("_") or _DEFAULT_CONTAINER_TAG
 
@@ -679,13 +678,23 @@ class SupermemoryMemoryProvider(MemoryProvider):
         self._client = None
         if self._active:
             try:
-                self._client = _SupermemoryClient(
-                    api_key=self._api_key,
-                    timeout=self._api_timeout,
-                    container_tag=self._container_tag,
-                    search_mode=self._search_mode,
-                    api_url=self._api_url,
-                )
+                try:
+                    self._client = _SupermemoryClient(
+                        api_key=self._api_key,
+                        timeout=self._api_timeout,
+                        container_tag=self._container_tag,
+                        search_mode=self._search_mode,
+                        api_url=self._api_url,
+                    )
+                except TypeError as exc:
+                    if "api_url" not in str(exc):
+                        raise
+                    self._client = _SupermemoryClient(
+                        api_key=self._api_key,
+                        timeout=self._api_timeout,
+                        container_tag=self._container_tag,
+                        search_mode=self._search_mode,
+                    )
             except Exception:
                 logger.warning("Supermemory initialization failed", exc_info=True)
                 self._active = False
