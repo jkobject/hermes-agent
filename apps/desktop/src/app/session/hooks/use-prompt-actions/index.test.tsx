@@ -329,7 +329,9 @@ describe('usePromptActions slash.exec dispatch payloads', () => {
     const requestGateway = vi.fn(async () => ({}) as never)
 
     let handle: HarnessHandle | null = null
-    render(<Harness onReady={h => (handle = h)} refreshSessions={async () => undefined} requestGateway={requestGateway} />)
+    render(
+      <Harness onReady={h => (handle = h)} refreshSessions={async () => undefined} requestGateway={requestGateway} />
+    )
 
     // `/ text` parses to an empty command name on every surface (CLI parity).
     // The composer draft was already cleared on submit and slash input never
@@ -1082,7 +1084,7 @@ describe('usePromptActions sleep/wake session recovery', () => {
     expect(ok).toBe(true)
     // First submit (stale id) → session.resume (stored id) → retry submit (fresh id).
     expect(calls.map(c => c.method)).toEqual(['prompt.submit', 'session.resume', 'prompt.submit'])
-    expect(calls[1]?.params).toEqual({ session_id: STORED_SESSION_ID })
+    expect(calls[1]?.params).toEqual({ session_id: STORED_SESSION_ID, source: 'desktop' })
     expect(calls[2]?.params).toEqual({ session_id: RECOVERED_SESSION_ID, text: 'message after wake' })
   })
 
@@ -1125,7 +1127,7 @@ describe('usePromptActions sleep/wake session recovery', () => {
 
     expect(calls.map(c => c.method)).toEqual(['session.interrupt', 'session.resume', 'session.interrupt'])
     expect(calls[0]?.params).toEqual({ session_id: RUNTIME_SESSION_ID })
-    expect(calls[1]?.params).toEqual({ session_id: STORED_SESSION_ID })
+    expect(calls[1]?.params).toEqual({ session_id: STORED_SESSION_ID, source: 'desktop' })
     expect(calls[2]?.params).toEqual({ session_id: RECOVERED_SESSION_ID })
   })
 

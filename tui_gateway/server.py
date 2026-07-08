@@ -275,7 +275,7 @@ _detached_ws_transport = _DropTransport()
 class _SlashWorker:
     """Persistent HermesCLI subprocess for slash commands."""
 
-    def __init__(self, session_key: str, model: str):
+    def __init__(self, session_key: str, model: str, profile_home: str | None = None):
         self._lock = threading.Lock()
         self._seq = 0
         self.stderr_tail: list[str] = []
@@ -294,6 +294,15 @@ class _SlashWorker:
         self._closed = False
         from hermes_cli._subprocess_compat import windows_hide_flags
 
+        # slash_worker runs the Hermes agent → needs provider credentials.
+        # Tier-1 secrets (gateway/GitHub/infra) are still stripped (#29157).
+        env = hermes_subprocess_env(inherit_credentials=True)
+        if profile_home:
+            # Global-remote / multi-profile sessions: the worker must resolve
+            # config/skills/state against the session's profile home, not the
+            # gateway's launch HERMES_HOME (#40677).
+            env["HERMES_HOME"] = str(profile_home)
+
         # start_new_session=True detaches the slash worker into its own
         # process group / session. Without this, the worker inherits the
         # gateway's pgid (= TUI parent PID). When mcp_tool's
@@ -310,9 +319,7 @@ class _SlashWorker:
             text=True,
             bufsize=1,
             cwd=os.getcwd(),
-            # slash_worker runs the Hermes agent → needs provider credentials.
-            # Tier-1 secrets (gateway/GitHub/infra) are still stripped (#29157).
-            env=hermes_subprocess_env(inherit_credentials=True),
+            env=env,
             creationflags=windows_hide_flags(),
             start_new_session=True,
         )
@@ -397,12 +404,18 @@ def _load_busy_input_mode() -> str:
     return raw if raw in {"queue", "steer", "interrupt"} else "interrupt"
 
 
-def _notify_session_boundary(event_type: str, session_id: str | None) -> None:
+def _notify_session_boundary(
+    event_type: str, session_id: str | None, platform: str | None = None
+) -> None:
     """Fire session lifecycle hooks with CLI parity."""
     try:
         from hermes_cli.plugins import invoke_hook as _invoke_hook
 
-        _invoke_hook(event_type, session_id=session_id, platform="tui")
+        _invoke_hook(
+            event_type,
+            session_id=session_id,
+            platform=_resolve_agent_platform(platform),
+        )
     except Exception:
         pass
 
@@ -470,6 +483,7 @@ def _transfer_active_session_slot(
     new_lease, limit_message = _claim_active_session_slot(
         new_session_id,
         live_session_id=sid,
+        surface=_session_source(session),
     )
     if new_lease is not None:
         old_lease = session.pop("active_session_lease", None)
@@ -490,6 +504,42 @@ def _transfer_active_session_slot(
             limit_message,
         )
     return False
+
+
+# Session sources the TUI/desktop backend must never end in state.db: the
+# messaging gateway owns those sessions' lifecycle — the TUI is only a viewer
+# (a resume of a Telegram/Discord/... session).  Ending one creates the
+# #60609 Groundhog Day routing loop (see _finalize_session).  Sources the
+# TUI backend itself creates ("tui", plus whatever a client passes as its
+# own ``source``) and the CLI's own sessions are NOT gateway-owned.
+_NON_GATEWAY_SOURCES = frozenset({
+    "", "tui", "cli", "webui", "desktop", "cron", "subagent", "test",
+    "local", "acp", "webhook", "api_server", "msgraph_webhook",
+})
+
+
+def _is_gateway_owned_source(source: str) -> bool:
+    """True when ``source`` names a messaging-gateway platform whose session
+    lifecycle belongs to the gateway, not to this TUI backend.
+
+    Structural rather than a hardcoded platform list: any source that
+    resolves to a known gateway ``Platform`` (built-in enum member OR a
+    registered platform plugin, via ``Platform._missing_``) counts, so new
+    platforms are covered automatically.  Local/self-owned sources are
+    excluded explicitly — ``local``/``webhook``/``api_server`` are Platform
+    members but their sessions are not owned by a remote chat surface that
+    routes by session_key, so reaping them is safe and keeps /resume clean.
+    """
+    src = (source or "").strip().lower()
+    if src in _NON_GATEWAY_SOURCES:
+        return False
+    try:
+        from gateway.config import Platform
+
+        Platform(src)  # raises ValueError for arbitrary non-platform strings
+        return True
+    except Exception:
+        return False
 
 
 def _finalize_session(session: dict | None, end_reason: str = "tui_close") -> None:
@@ -569,7 +619,7 @@ def _finalize_session(session: dict | None, end_reason: str = "tui_close") -> No
 
     session_key = session.get("session_key")
     session_id = getattr(agent, "session_id", None) or session_key
-    _notify_session_boundary("on_session_finalize", session_id)
+    _notify_session_boundary("on_session_finalize", session_id, _session_source(session))
 
     # Mark session ended in DB so it doesn't linger as a ghost row in /resume.
     # Use session_id (from agent.session_id) not session_key — after compression,
@@ -579,7 +629,17 @@ def _finalize_session(session: dict | None, end_reason: str = "tui_close") -> No
         try:
             db = _get_db()
             if db is not None:
-                db.end_session(session_id, end_reason)
+                # Don't end gateway-originated sessions — the gateway owns
+                # their lifecycle.  The TUI is a viewer, not the owner.
+                # Ending a gateway session in state.db triggers a Groundhog
+                # Day routing loop: the gateway's #54878 self-heal detects
+                # the stale entry, recovers to the parent session, context
+                # compression splits back to the reaped child, and the cycle
+                # repeats on every inbound message.  (#60609)
+                row = db.get_session(session_id)
+                source = (row or {}).get("source", "")
+                if not _is_gateway_owned_source(source):
+                    db.end_session(session_id, end_reason)
         except Exception:
             pass
 
@@ -955,6 +1015,24 @@ def _profile_scoped(handler):
 _CWD_PLACEHOLDERS = {".", "auto", "cwd"}
 
 
+def _configured_cwd_from_cfg(cfg: dict | None) -> str | None:
+    """Return an absolute, existing ``terminal.cwd`` from a config mapping.
+
+    Returns None for placeholders (``.``/``auto``/``cwd``), missing values, or
+    paths that don't resolve to a real directory.
+    """
+    if not isinstance(cfg, dict):
+        return None
+    terminal_cfg = cfg.get("terminal")
+    if not isinstance(terminal_cfg, dict):
+        return None
+    raw = str(terminal_cfg.get("cwd") or "").strip()
+    if not raw or raw in _CWD_PLACEHOLDERS:
+        return None
+    resolved = os.path.abspath(os.path.expanduser(raw))
+    return resolved if os.path.isdir(resolved) else None
+
+
 def _profile_configured_cwd(profile_home: Path | None) -> str | None:
     """Resolve a non-launch profile's ``terminal.cwd`` from its own config.yaml.
 
@@ -974,13 +1052,37 @@ def _profile_configured_cwd(profile_home: Path | None) -> str | None:
             return None
         with open(p, encoding="utf-8") as f:
             data = yaml.safe_load(f) or {}
-        raw = str((data.get("terminal") or {}).get("cwd") or "").strip()
-        if not raw or raw in _CWD_PLACEHOLDERS:
-            return None
-        resolved = os.path.abspath(os.path.expanduser(raw))
-        return resolved if os.path.isdir(resolved) else None
+        return _configured_cwd_from_cfg(data)
     except Exception:
         return None
+
+
+def _launch_configured_cwd() -> str | None:
+    """Resolve the launch profile's ``terminal.cwd`` from config.yaml.
+
+    Dashboard ``/chat`` for the launch profile attaches to the dashboard
+    process's in-memory TUI gateway. The Node PTY child receives a bridged
+    ``TERMINAL_CWD`` env var, but this in-memory process does not — so reading
+    the process env alone leaves a fresh chat starting in ``os.getcwd()``
+    (wherever ``hermes dashboard`` was launched) instead of the configured
+    ``terminal.cwd``. Read config directly so changing ``terminal.cwd`` affects
+    new in-memory TUI sessions too.
+    """
+    try:
+        return _configured_cwd_from_cfg(_load_cfg())
+    except Exception:
+        return None
+
+
+def _default_session_cwd() -> str:
+    """Fallback cwd for a session with no explicit / stored / profile cwd.
+
+    Mirrors the launch-config-aware tail of :func:`_completion_cwd` so freshly
+    created AND resumed sessions land in the configured ``terminal.cwd`` rather
+    than ``os.getcwd()`` when the in-memory gateway's process env has no bridged
+    ``TERMINAL_CWD``.
+    """
+    return _launch_configured_cwd() or os.getenv("TERMINAL_CWD") or os.getcwd()
 
 
 def write_json(obj: dict) -> bool:
@@ -1227,6 +1329,7 @@ def _start_agent_build(sid: str, session: dict) -> None:
                 kw = {"session_db": session_db}
                 if resume_sid := current.get("resume_session_id"):
                     kw["session_id"] = resume_sid
+                kw["platform_override"] = _session_source(current)
                 resume_overrides = current.get("resume_runtime_overrides")
                 if isinstance(resume_overrides, dict) and resume_overrides:
                     # Cold deferred resume: restore the full persisted runtime
@@ -1257,7 +1360,11 @@ def _start_agent_build(sid: str, session: dict) -> None:
             current["config_model_seen"] = _config_model_target()
 
             try:
-                worker = _SlashWorker(key, getattr(agent, "model", _resolve_model()))
+                worker = _SlashWorker(
+                    key,
+                    getattr(agent, "model", _resolve_model()),
+                    profile_home=current.get("profile_home"),
+                )
                 _attach_worker(sid, current, worker)
             except Exception:
                 pass
@@ -1302,7 +1409,7 @@ def _start_agent_build(sid: str, session: dict) -> None:
             with _sessions_lock:
                 if sid in _sessions:
                     _sessions[sid]["_notif_stop"] = _start_notification_poller(sid, _sessions[sid])
-            _notify_session_boundary("on_session_reset", key)
+            _notify_session_boundary("on_session_reset", key, _session_source(current))
 
             info = _session_info(agent, current)
             cfg_warn = _probe_config_health(_load_cfg())
@@ -1373,6 +1480,11 @@ def _completion_cwd(params: dict | None = None) -> str:
         # A session bound to another profile resolves its workspace from THAT
         # profile's config before falling back to the launch profile's env var.
         or _profile_configured_cwd(_profile_home(params.get("profile")))
+        # The launch profile's dashboard /chat attaches to the dashboard's
+        # in-memory gateway, which does NOT inherit the PTY child's bridged
+        # TERMINAL_CWD. Read the launch profile's config.yaml directly so a
+        # configured terminal.cwd wins over a stale process env / launch dir.
+        or _launch_configured_cwd()
         or os.environ.get("TERMINAL_CWD")
         or os.getcwd()
     )
@@ -1499,7 +1611,7 @@ def _session_source(session: dict | None) -> str:
         source = str(session.get("source") or "").strip()
         if source:
             return source
-    return "tui"
+    return _resolve_session_platform()
 
 
 def _register_session_cwd(session: dict | None) -> None:
@@ -1805,10 +1917,10 @@ def _apply_managed(cfg: dict) -> dict:
 def _save_cfg(cfg: dict):
     global _cfg_cache, _cfg_mtime, _cfg_path
 
-    from utils import atomic_yaml_write
+    from hermes_cli.config import atomic_config_write
 
     path = _hermes_home / "config.yaml"
-    atomic_yaml_write(path, cfg)
+    atomic_config_write(path, cfg)
     with _cfg_lock:
         _cfg_cache = copy.deepcopy(cfg)
         _cfg_path = path
@@ -1843,7 +1955,7 @@ def _set_session_context(session_key: str, cwd: str | None = None) -> list:
         # know the parent workspace pass it explicitly so spawned agents inherit
         # it instead of falling back to the gateway launch dir.
         resolved = cwd if cwd is not None else _cwd_for_session_key(session_key)
-        source = "tui"
+        source = _resolve_session_platform()
         with _sessions_lock:
             for sess in list(_sessions.values()):
                 if sess.get("session_key") == session_key:
@@ -1946,15 +2058,58 @@ def _resolve_model() -> str:
     return "anthropic/claude-sonnet-4"
 
 
-def _config_model_target() -> tuple[str, str]:
-    """(model, provider) currently selected by config (env as fallback).
+def _resolve_session_platform() -> str:
+    """Resolve the platform tag for a tui_gateway-routed session.
 
-    config.yaml wins over HERMES_MODEL / HERMES_INFERENCE_MODEL here, the
-    reverse of `_resolve_model()`'s startup order. Those env vars are a
-    provision-time seed (hosted instances set HERMES_INFERENCE_MODEL in the
-    container env); if they outranked config.yaml, the per-turn sync would
-    stay pinned to the seed forever and dashboard/CLI model changes would
-    never reach an open chat — the exact bug this sync exists to fix.
+    The desktop app's chat panel and the standalone TUI both speak to this
+    gateway; without a branch they all get stamped ``platform="tui"``,
+    which makes the agent think it's talking to a terminal user. That
+    mis-tag is the root cause of the desktop chat agent suggesting
+    TUI-only slash commands (``/reload-mcp``, …) to chat-panel users.
+
+    Resolution:
+      * ``HERMES_DESKTOP=1`` and ``HERMES_DESKTOP_TERMINAL`` unset → "desktop"
+        (the chat-panel backend — a graphical React surface, not a terminal).
+      * ``HERMES_DESKTOP_TERMINAL=1`` → "tui"
+        (``hermes --tui`` running in the desktop's embedded terminal pane;
+        it IS a TUI, just embedded. The clarifier attached to the tui hint
+        in system_prompt.py tells the agent about the embedding.)
+      * neither set → "tui"
+        (standalone ``hermes --tui``.)
+    """
+    if is_truthy_value(os.environ.get("HERMES_DESKTOP")) and not is_truthy_value(
+        os.environ.get("HERMES_DESKTOP_TERMINAL")
+    ):
+        return "desktop"
+    return "tui"
+
+
+def _resolve_session_source(explicit: str | None) -> str:
+    """Default the session DB ``source`` field from the resolved platform.
+
+    A caller that explicitly passes ``source`` (e.g. a plugin session tagged
+    ``"telegram"``) keeps its value. Only an empty/None ``source`` falls back
+    to the env-resolved platform — so env-driven resolution never silently
+    rewrites a caller's intent.
+    """
+    if explicit:
+        return explicit
+    return _resolve_session_platform()
+
+
+def _resolve_agent_platform(source: str | None) -> str:
+    return _resolve_session_source(source)
+
+
+def _config_model_target() -> tuple[str, str]:
+    """(model, provider) currently selected by config.yaml — and ONLY config.
+
+    Unlike `_resolve_model()`, this never reads HERMES_MODEL /
+    HERMES_INFERENCE_MODEL. Those env vars are a launch-scoped seed
+    (`hermes --tui -m <model>`, hosted-instance provisioning); if they
+    fed the per-turn sync, the seed would be replayed as a /model switch
+    and persisted globally, or would pin the session so dashboard/CLI
+    model changes never reach an open chat.
     """
     cfg_model = _load_cfg().get("model")
     model = ""
@@ -1966,8 +2121,15 @@ def _config_model_target() -> tuple[str, str]:
             provider = ""
     elif isinstance(cfg_model, str):
         model = cfg_model.strip()
-    if not model:
-        model = _resolve_model()
+    # No fallback to _resolve_model() here: that reads HERMES_MODEL /
+    # HERMES_INFERENCE_MODEL, which `hermes --tui -m <model>` sets as a
+    # session-scoped seed for THIS launch. When config.yaml has no
+    # model.default (custom-provider-only setups), falling back to the env
+    # seed made the per-turn sync treat the -m flag as "the configured
+    # model" and replay it as a /model switch — which then persisted the
+    # one-shot flag into config.yaml globally (#-m leak). An empty model
+    # simply means "config expresses no preference": the sync is a no-op
+    # and the agent keeps whatever it was built with.
     return model, provider
 
 
@@ -2364,7 +2526,9 @@ def _load_provider_routing() -> dict:
 
 
 def _load_show_reasoning() -> bool:
-    return bool((_load_cfg().get("display") or {}).get("show_reasoning", False))
+    # Fallback True — keep in sync with DEFAULT_CONFIG display.show_reasoning
+    # (this loader reads the raw user YAML without the DEFAULT_CONFIG merge).
+    return bool((_load_cfg().get("display") or {}).get("show_reasoning", True))
 
 
 def _load_memory_notifications() -> str:
@@ -2415,7 +2579,7 @@ def _load_enabled_toolsets() -> list[str] | None:
         try:
             from agent.coding_context import coding_selection
 
-            selection = coding_selection(platform="tui")
+            selection = coding_selection(platform=_resolve_session_platform())
             if selection is not None:
                 # Fold in `project` here too: this is a GUI-only resolver, and
                 # the focus-mode coding posture returns before the fallback path
@@ -2572,6 +2736,7 @@ def _restart_slash_worker(sid: str, session: dict):
         new_worker = _SlashWorker(
             session["session_key"],
             getattr(session.get("agent"), "model", _resolve_model()),
+            profile_home=session.get("profile_home"),
         )
     except Exception:
         session["slash_worker"] = None
@@ -2611,6 +2776,7 @@ def _apply_model_switch(
     confirm_expensive_model: bool = False,
     pin_session_override: bool = True,
     parsed_flags: tuple[str, str, bool, bool, bool] | None = None,
+    persist_override: bool | None = None,
 ) -> dict:
     from hermes_cli.model_switch import (
         parse_model_flags,
@@ -2628,7 +2794,11 @@ def _apply_model_switch(
         _force_refresh,
         is_session,
     ) = parsed_flags
-    persist_global = resolve_persist_behavior(is_global_flag, is_session)
+    persist_global = (
+        persist_override
+        if persist_override is not None
+        else resolve_persist_behavior(is_global_flag, is_session)
+    )
     if not model_input:
         raise ValueError("model value required")
 
@@ -2820,6 +2990,12 @@ def _sync_agent_model_with_config(sid: str, session: dict) -> None:
             raw,
             confirm_expensive_model=True,
             pin_session_override=False,
+            # This sync ADOPTS a config.yaml change into the live session; it
+            # must never write config back. Without this, the flag/config
+            # default (persist_switch_by_default=True) re-persisted whatever
+            # target the sync computed — the path that leaked `hermes --tui -m`
+            # into config.yaml as the permanent global model.
+            persist_override=False,
         )
     except Exception as e:
         _emit(
@@ -3159,6 +3335,18 @@ def _session_info(agent, session: dict | None = None) -> dict:
         "usage": _get_usage(agent),
         "profile_name": _current_profile_name(),
     }
+    try:
+        from hermes_cli.config import (
+            detect_install_method,
+            format_unsupported_install_warning,
+            is_unsupported_install_method,
+        )
+
+        _install_method = detect_install_method()
+        if is_unsupported_install_method(_install_method):
+            info["install_warning"] = format_unsupported_install_warning(_install_method)
+    except Exception:
+        pass
     try:
         from hermes_cli import __version__, __release_date__
 
@@ -4085,6 +4273,7 @@ def _reset_session_agent(sid: str, session: dict) -> dict:
             sid,
             session["session_key"],
             session_id=session["session_key"],
+            platform_override=_session_source(session),
             **reset_kw,
         )
     finally:
@@ -4234,6 +4423,7 @@ def _make_agent(
     provider_override: str | None = None,
     reasoning_config_override: dict | None = None,
     service_tier_override: str | None = None,
+    platform_override: str | None = None,
 ):
     from run_agent import AIAgent
 
@@ -4376,7 +4566,7 @@ def _make_agent(
         provider_sort=_pr.get("sort"),
         provider_require_parameters=_pr.get("require_parameters", False),
         provider_data_collection=_pr.get("data_collection"),
-        platform="tui",
+        platform=_resolve_agent_platform(platform_override),
         session_id=session_id or key,
         session_db=session_db if session_db is not None else _get_db(),
         ephemeral_system_prompt=system_prompt or None,
@@ -4397,6 +4587,7 @@ def _init_session(
     cols: int = 80,
     cwd: str | None = None,
     session_db=None,
+    source: str | None = None,
 ):
     now = time.time()
     with _sessions_lock:
@@ -4416,6 +4607,7 @@ def _init_session(
             "cols": cols,
             "slash_worker": None,
             "show_reasoning": _load_show_reasoning(),
+            "source": _resolve_session_source(source),
             "tool_progress_mode": _load_tool_progress_mode(),
             "edit_snapshots": {},
             "tool_started_at": {},
@@ -4447,7 +4639,11 @@ def _init_session(
         _attach_worker(
             sid,
             _sessions[sid],
-            _SlashWorker(key, getattr(agent, "model", _resolve_model())),
+            _SlashWorker(
+                key,
+                getattr(agent, "model", _resolve_model()),
+                profile_home=_sessions[sid].get("profile_home"),
+            ),
         )
     except Exception:
         # Defer hard-failure to slash.exec; chat still works without slash worker.
@@ -4480,7 +4676,7 @@ def _init_session(
     with _sessions_lock:
         if sid in _sessions:
             _sessions[sid]["_notif_stop"] = _start_notification_poller(sid, _sessions[sid])
-    _notify_session_boundary("on_session_reset", key)
+    _notify_session_boundary("on_session_reset", key, _session_source(_sessions.get(sid, {})))
     _emit("session.info", sid, _session_info(agent, _sessions.get(sid, {})))
     _schedule_mcp_late_refresh(sid, agent)
 
@@ -4926,7 +5122,7 @@ def _(rid, params: dict) -> dict:
     except Exception:
         explicit_cwd = False
     resolved_cwd = _completion_cwd(params)
-    source = str(params.get("source") or "tui").strip() or "tui"
+    source = _resolve_session_source(str(params.get("source") or "").strip() or None)
     _enable_gateway_prompts()
 
     # ``profile`` (app-global remote mode): a new chat started under a non-launch
@@ -4961,7 +5157,9 @@ def _(rid, params: dict) -> dict:
 
     ready = threading.Event()
     now = time.time()
-    lease, limit_message = _claim_active_session_slot(key, live_session_id=sid)
+    lease, limit_message = _claim_active_session_slot(
+        key, live_session_id=sid, surface=source
+    )
     if limit_message is not None:
         return _err(rid, 4090, limit_message)
 
@@ -5387,7 +5585,10 @@ def _(rid, params: dict) -> dict:
     # (resume_session_id keeps the upgrade on the stored conversation).
     if is_truthy_value(params.get("lazy", False)):
         sid = uuid.uuid4().hex[:8]
-        lease, limit_message = _claim_active_session_slot(target, live_session_id=sid)
+        source = _resolve_session_source(str(params.get("source") or "").strip() or None)
+        lease, limit_message = _claim_active_session_slot(
+            target, live_session_id=sid, surface=source
+        )
         if limit_message is not None:
             return _err(rid, 4090, limit_message)
         try:
@@ -5399,14 +5600,14 @@ def _(rid, params: dict) -> dict:
             if lease is not None:
                 lease.release()
             return _err(rid, 5000, f"resume failed: {e}")
-        cwd = profile_resume_cwd or os.getenv("TERMINAL_CWD", os.getcwd())
+        cwd = profile_resume_cwd or _default_session_cwd()
         record = _deferred_session_record(
             target,
             cols=cols,
             cwd=cwd,
             history=history,
             lease=lease,
-            source=str(params.get("source") or "tui").strip() or "tui",
+            source=source,
             close_on_disconnect=is_truthy_value(params.get("close_on_disconnect", False)),
             profile_home=profile_home,
             lazy=True,
@@ -5448,7 +5649,10 @@ def _(rid, params: dict) -> dict:
     # session's persisted runtime identity, and is a real (upgradable) session.
     if not is_truthy_value(params.get("eager_build", False)):
         sid = uuid.uuid4().hex[:8]
-        lease, limit_message = _claim_active_session_slot(target, live_session_id=sid)
+        source = _resolve_session_source(str(params.get("source") or "").strip() or None)
+        lease, limit_message = _claim_active_session_slot(
+            target, live_session_id=sid, surface=source
+        )
         if limit_message is not None:
             return _err(rid, 4090, limit_message)
         # Interactive resume routes approvals/clarify through gateway prompts;
@@ -5472,14 +5676,14 @@ def _(rid, params: dict) -> dict:
         # the build drops the provider ("No LLM provider configured").
         overrides = _stored_session_runtime_overrides(found) or {}
         model_override = overrides.get("model_override") or {}
-        cwd = profile_resume_cwd or os.getenv("TERMINAL_CWD", os.getcwd())
+        cwd = profile_resume_cwd or _default_session_cwd()
         record = _deferred_session_record(
             target,
             cols=cols,
             cwd=cwd,
             history=history,
             lease=lease,
-            source=str(params.get("source") or "tui").strip() or "tui",
+            source=source,
             close_on_disconnect=is_truthy_value(params.get("close_on_disconnect", False)),
             display_history_prefix=prefix,
             profile_home=profile_home,
@@ -5518,7 +5722,10 @@ def _(rid, params: dict) -> dict:
     # _session_resume_lock across it would stall session.close on the main
     # dispatch thread (it's not a _LONG_HANDLER), blocking fast-path RPCs.
     sid = uuid.uuid4().hex[:8]
-    lease, limit_message = _claim_active_session_slot(target, live_session_id=sid)
+    source = _resolve_session_source(str(params.get("source") or "").strip() or None)
+    lease, limit_message = _claim_active_session_slot(
+        target, live_session_id=sid, surface=source
+    )
     if limit_message is not None:
         return _err(rid, 4090, limit_message)
     _enable_gateway_prompts()
@@ -5556,6 +5763,7 @@ def _(rid, params: dict) -> dict:
                 target,
                 session_id=target,
                 session_db=db,
+                platform_override=source,
                 **stored_runtime_overrides,
             )
         finally:
@@ -5606,6 +5814,7 @@ def _(rid, params: dict) -> dict:
                     cols=cols,
                     cwd=profile_resume_cwd,
                     session_db=db,
+                    source=source,
                 )
             finally:
                 if init_home_token is not None:
@@ -5758,7 +5967,7 @@ def _fallback_session_info(session: dict) -> dict:
     if agent is not None:
         return _session_info(agent)
     return {
-        "cwd": os.getenv("TERMINAL_CWD", os.getcwd()),
+        "cwd": _default_session_cwd(),
         "lazy": True,
         "model": _resolve_model(),
         "skills": {},
@@ -7776,7 +7985,10 @@ def _(rid, params: dict) -> dict:
         return _err(rid, 4008, "nothing to branch — send a message first")
     new_key = _new_session_key()
     new_sid = uuid.uuid4().hex[:8]
-    lease, limit_message = _claim_active_session_slot(new_key, live_session_id=new_sid)
+    source = _session_source(session)
+    lease, limit_message = _claim_active_session_slot(
+        new_key, live_session_id=new_sid, surface=source
+    )
     if limit_message is not None:
         return _err(rid, 4090, limit_message)
     branch_name = params.get("name", "")
@@ -7792,7 +8004,7 @@ def _(rid, params: dict) -> dict:
             )
         db.create_session(
             new_key,
-            source=_session_source(session),
+            source=source,
             model=_resolve_model(),
             # Stable _branched_from marker so list_sessions_rich() keeps the
             # branch visible in /resume and /sessions. The TUI branch leaves
@@ -7817,11 +8029,21 @@ def _(rid, params: dict) -> dict:
     try:
         tokens = _set_session_context(new_key)
         try:
-            agent = _make_agent(new_sid, new_key, session_id=new_key)
+            agent = _make_agent(
+                new_sid,
+                new_key,
+                session_id=new_key,
+                platform_override=source,
+            )
         finally:
             _clear_session_context(tokens)
         _init_session(
-            new_sid, new_key, agent, list(history), cols=session.get("cols", 80)
+            new_sid,
+            new_key,
+            agent,
+            list(history),
+            cols=session.get("cols", 80),
+            source=source,
         )
         if new_sid in _sessions:
             _sessions[new_sid]["active_session_lease"] = lease
@@ -8346,11 +8568,19 @@ def _notification_poller_loop(
             _emit("status.update", sid, {"kind": "process", "text": text})
             _emitted.add(_dedup_key)
 
+        _requeued = False
         with session["history_lock"]:
             if session.get("running"):
                 process_registry.completion_queue.put(evt)
-                continue
-            session["running"] = True
+                _requeued = True
+            else:
+                session["running"] = True
+        if _requeued:
+            # Back off before re-polling: the re-queued event keeps the queue
+            # non-empty, so without a sleep this loop spins at full speed
+            # (100% CPU, GIL churn) for as long as the session stays busy.
+            time.sleep(0.25)
+            continue
 
         rid = f"__notif__{int(time.time() * 1000)}"
         try:
@@ -8651,6 +8881,9 @@ def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
                                 _raw,
                                 confirm_expensive_model=False,
                                 pin_session_override=bool(_prev_override),
+                                # Session-internal restore after the /moa
+                                # one-shot — never persist to config.yaml.
+                                persist_override=False,
                             )
                         except Exception as _moa_restore_exc:
                             logger.warning(
@@ -10828,7 +11061,7 @@ def _(rid, params: dict) -> dict:
                 effort = str(raw_effort or "medium")
         display = (
             "show"
-            if bool((cfg.get("display") or {}).get("show_reasoning", False))
+            if bool((cfg.get("display") or {}).get("show_reasoning", True))
             else "hide"
         )
         return _ok(rid, {"value": effort, "display": display})
@@ -11510,6 +11743,9 @@ def _(rid, params: dict) -> dict:
                         f"{preset} --provider moa",
                         confirm_expensive_model=False,
                         pin_session_override=True,
+                        # One-shot turn-scoped swap — never persist the MoA
+                        # virtual provider to config.yaml.
+                        persist_override=False,
                     )
                 except Exception as exc:
                     session.pop("moa_one_shot_restore", None)
@@ -12309,22 +12545,25 @@ def _(rid, params: dict) -> dict:
             ),
             current_base_url=getattr(agent, "base_url", "") if agent else "",
         )
-        # picker_hints + canonical_order produce the TUI's required shape:
+        # picker_hints + canonical_order produce the TUI/desktop picker shape:
         # `authenticated`/`auth_type`/`key_env`/`warning` per row, in
-        # CANONICAL_PROVIDERS declaration order. include_unconfigured=True
-        # so the picker can show the full provider universe (with the
-        # setup-hint warning attached) instead of only authed rows.
+        # CANONICAL_PROVIDERS declaration order. Desktop pickers default to the
+        # configured subset; callers that need setup affordances can pass
+        # include_unconfigured=true explicitly.
         # Curated model lists are preserved — list_authenticated_providers
         # populates `models` from the curated catalog, not provider_model_ids
         # (which would pull non-agentic models like TTS/embeddings/etc.).
         payload = build_models_payload(
             ctx,
-            include_unconfigured=True,
+            explicit_only=bool(params.get("explicit_only")),
+            include_unconfigured=bool(params.get("include_unconfigured")),
             picker_hints=True,
             canonical_order=True,
             pricing=True,
             capabilities=True,
             refresh=bool(params.get("refresh")),
+            probe_custom_providers=bool(params.get("refresh")),
+            probe_current_custom_provider=not bool(params.get("refresh")),
         )
         return _ok(rid, payload)
     except Exception as e:
@@ -12635,6 +12874,7 @@ def _(rid, params: dict) -> dict:
             worker = _SlashWorker(
                 session["session_key"],
                 getattr(session.get("agent"), "model", _resolve_model()),
+                profile_home=session.get("profile_home"),
             )
             _attach_worker(params.get("session_id", ""), session, worker)
         except Exception as e:
@@ -13217,13 +13457,14 @@ def _browser_connect(rid, params: dict) -> dict:
             ok = any(_http_ok(p, timeout=2.0) for p in probes)
 
             if not ok and _is_default_local_cdp(parsed):
-                from hermes_cli.browser_connect import try_launch_chrome_debug
+                from hermes_cli.browser_connect import launch_chrome_debug
 
                 announce(
                     "Chromium-family browser isn't running with remote debugging — attempting to launch..."
                 )
 
-                if try_launch_chrome_debug(port, system):
+                launch = launch_chrome_debug(port, system)
+                if launch.launched:
                     for _ in range(20):
                         time.sleep(0.5)
                         if any(_http_ok(p, timeout=1.0) for p in probes):
@@ -13233,6 +13474,9 @@ def _browser_connect(rid, params: dict) -> dict:
                 if ok:
                     announce(f"Chromium-family browser launched and listening on port {port}")
                 else:
+                    hint = launch.hint
+                    if hint:
+                        announce(hint, level="error")
                     for line in _failure_messages(url, port, system)[1:]:
                         announce(line, level="error")
                     return _ok(
