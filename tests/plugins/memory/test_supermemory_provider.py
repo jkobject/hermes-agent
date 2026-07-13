@@ -17,11 +17,13 @@ from plugins.memory.supermemory import (
 
 
 class FakeClient:
-    def __init__(self, api_key: str, timeout: float, container_tag: str, search_mode: str = "hybrid"):
+    def __init__(self, api_key: str, timeout: float, container_tag: str,
+                 search_mode: str = "hybrid", api_url: str = ""):
         self.api_key = api_key
         self.timeout = timeout
         self.container_tag = container_tag
         self.search_mode = search_mode
+        self.api_url = api_url
         self.add_calls = []
         self.search_results = []
         self.profile_response = {"static": [], "dynamic": [], "search_results": []}
@@ -194,6 +196,26 @@ def test_on_session_end_ingests_clean_messages(provider):
     assert payload["metadata"]["message_count"] == 2
     # Buffer is cleared after a normal session-end ingest.
     assert provider._session_turns == []
+
+
+def test_auto_capture_false_disables_all_session_ingest(monkeypatch, tmp_path):
+    monkeypatch.setenv("SUPERMEMORY_API_KEY", "test-key")
+    monkeypatch.setattr("plugins.memory.supermemory._SupermemoryClient", FakeClient)
+    _save_supermemory_config({"auto_capture": False}, str(tmp_path))
+    provider = SupermemoryMemoryProvider()
+    provider.initialize("session-1", hermes_home=str(tmp_path), platform="cli")
+
+    messages = [
+        {"role": "user", "content": "temporary task status"},
+        {"role": "assistant", "content": "the task completed"},
+    ]
+    provider.sync_turn(messages[0]["content"], messages[1]["content"])
+    provider.on_session_end(messages)
+    provider.on_session_switch("session-2", reset=True)
+    provider.shutdown()
+
+    assert provider._session_turns == []
+    assert provider._client.ingest_calls == []
 
 
 def test_merge_metadata_stamps_sm_source():
@@ -548,6 +570,23 @@ def test_probe_supermemory_connection_success(monkeypatch, tmp_path):
     assert status["ok"] is True
     assert status["profile_facts"] == 2
     assert status["auto_recall"] is True
+
+
+def test_probe_supermemory_connection_uses_configured_api_url(monkeypatch, tmp_path):
+    _stub_supermemory_importable(monkeypatch)
+    _save_supermemory_config({"api_url": "http://localhost:6767"}, str(tmp_path))
+    seen = {}
+
+    class RecordingClient(FakeClient):
+        def __init__(self, *args, **kwargs):
+            seen.update(kwargs)
+            super().__init__(*args, **kwargs)
+
+    monkeypatch.setattr("plugins.memory.supermemory._SupermemoryClient", RecordingClient)
+    status = _probe_supermemory_connection("test-key", str(tmp_path))
+
+    assert status["ok"] is True
+    assert seen["api_url"] == "http://localhost:6767"
 
 
 def test_probe_supermemory_connection_client_error(monkeypatch, tmp_path):
