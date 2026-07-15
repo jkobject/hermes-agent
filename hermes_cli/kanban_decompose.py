@@ -273,6 +273,7 @@ def decompose_task(
     *,
     author: Optional[str] = None,
     timeout: Optional[int] = None,
+    automatic: bool = False,
 ) -> DecomposeOutcome:
     """Decompose a triage task into a graph of child tasks.
 
@@ -371,6 +372,10 @@ def decompose_task(
                 task_id, False, "decomposer returned fanout=false with no title/body",
             )
         with kb.connect_closing() as conn:
+            if automatic and kb.is_block_loop_frozen(conn, task_id):
+                return DecomposeOutcome(
+                    task_id, False, "task acquired a block-loop freeze during decomposition",
+                )
             ok = kb.specify_triage_task(
                 conn,
                 task_id,
@@ -378,8 +383,15 @@ def decompose_task(
                 body=body_val,
                 assignee=assignee_val,
                 author=audit_author,
+                respect_block_loop_freeze=automatic,
             )
         if not ok:
+            if automatic:
+                with kb.connect_closing() as conn:
+                    if kb.is_block_loop_frozen(conn, task_id):
+                        return DecomposeOutcome(
+                            task_id, False, "task acquired a block-loop freeze during decomposition",
+                        )
             return DecomposeOutcome(
                 task_id, False, "task moved out of triage before promotion",
             )
@@ -440,6 +452,10 @@ def decompose_task(
 
     try:
         with kb.connect_closing() as conn:
+            if automatic and kb.is_block_loop_frozen(conn, task_id):
+                return DecomposeOutcome(
+                    task_id, False, "task acquired a block-loop freeze during decomposition",
+                )
             child_ids = kb.decompose_triage_task(
                 conn,
                 task_id,
@@ -447,6 +463,7 @@ def decompose_task(
                 children=children,
                 author=audit_author,
                 auto_promote=auto_promote,
+                respect_block_loop_freeze=automatic,
             )
     except ValueError as exc:
         return DecomposeOutcome(task_id, False, f"DB rejected graph: {exc}")
@@ -455,6 +472,12 @@ def decompose_task(
         return DecomposeOutcome(task_id, False, f"DB error: {type(exc).__name__}")
 
     if child_ids is None:
+        if automatic:
+            with kb.connect_closing() as conn:
+                if kb.is_block_loop_frozen(conn, task_id):
+                    return DecomposeOutcome(
+                        task_id, False, "task acquired a block-loop freeze during decomposition",
+                    )
         return DecomposeOutcome(
             task_id, False, "task moved out of triage before decomposition",
         )
@@ -465,8 +488,10 @@ def decompose_task(
     )
 
 
-def list_triage_ids(*, tenant: Optional[str] = None) -> list[str]:
-    """Return task ids currently in the triage column."""
+def list_triage_ids(
+    *, tenant: Optional[str] = None, auto_only: bool = False,
+) -> list[str]:
+    """Return triage ids, optionally excluding circuit-breaker escalations."""
     with kb.connect_closing() as conn:
         rows = kb.list_tasks(
             conn,
@@ -474,4 +499,9 @@ def list_triage_ids(*, tenant: Optional[str] = None) -> list[str]:
             tenant=tenant,
             limit=1000,
         )
+        if auto_only:
+            rows = [
+                row for row in rows
+                if not kb.is_block_loop_frozen(conn, row.id)
+            ]
     return [row.id for row in rows]
