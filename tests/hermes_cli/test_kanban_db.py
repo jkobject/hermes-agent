@@ -1809,6 +1809,159 @@ def test_dispatch_reclaims_stale_before_spawning(kanban_home):
 # Respawn guard (check_respawn_guard + dispatch_once integration)
 # ---------------------------------------------------------------------------
 
+def test_respawn_guard_freezes_block_loop_even_if_task_is_forced_ready(kanban_home):
+    """A cosmetic promotion cannot cause a third identical worker launch."""
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="looping", assignee="alice")
+        conn.execute("UPDATE tasks SET block_recurrences = 2 WHERE id = ?", (t,))
+        conn.execute(
+            "INSERT INTO task_events (task_id, kind, payload, created_at) "
+            "VALUES (?, 'block_loop_detected', '{}', 100)",
+            (t,),
+        )
+        assert kb.check_respawn_guard(conn, t) == "block_loop_frozen"
+
+
+def test_respawn_guard_explicit_rearm_releases_block_loop(kanban_home):
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="looping", assignee="alice")
+        conn.execute(
+            "UPDATE tasks SET status = 'triage', block_recurrences = 2 WHERE id = ?",
+            (t,),
+        )
+        conn.execute(
+            "INSERT INTO task_events (task_id, kind, payload, created_at) "
+            "VALUES (?, 'block_loop_detected', '{}', 100)",
+            (t,),
+        )
+        assert kb.unblock_task(conn, t) is True
+        assert kb.check_respawn_guard(conn, t) is None
+
+
+def test_respawn_guard_same_second_event_order_controls_rearm(kanban_home):
+    """Second-resolution timestamps must not let stale rearm release a new loop."""
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="looping", assignee="alice")
+        conn.execute(
+            "INSERT INTO task_events (task_id, kind, payload, created_at) "
+            "VALUES (?, 'unblocked', '{}', 100)",
+            (t,),
+        )
+        conn.execute(
+            "INSERT INTO task_events (task_id, kind, payload, created_at) "
+            "VALUES (?, 'block_loop_detected', '{}', 100)",
+            (t,),
+        )
+        assert kb.is_block_loop_frozen(conn, t) is True
+
+        conn.execute(
+            "INSERT INTO task_events (task_id, kind, payload, created_at) "
+            "VALUES (?, 'unblocked', '{}', 100)",
+            (t,),
+        )
+        assert kb.is_block_loop_frozen(conn, t) is False
+
+
+def test_unblock_rechecks_frozen_triage_inside_write_transaction(
+    kanban_home, monkeypatch,
+):
+    """Unblock must not reuse a frozen-state snapshot read before its txn."""
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="looping", assignee="alice", triage=True)
+        conn.execute(
+            "INSERT INTO task_events (task_id, kind, payload, created_at) "
+            "VALUES (?, 'block_loop_detected', '{}', 100)",
+            (t,),
+        )
+        calls = []
+        original = kb.is_block_loop_frozen
+
+        def observed(c, task_id):
+            calls.append(c.in_transaction)
+            return original(c, task_id)
+
+        monkeypatch.setattr(kb, "is_block_loop_frozen", observed)
+        assert kb.unblock_task(conn, t) is True
+
+    assert calls == [True]
+
+
+def test_respawn_guard_worker_cannot_self_rearm_block_loop(kanban_home):
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="looping", assignee="dev")
+        conn.execute("UPDATE tasks SET block_recurrences = 2 WHERE id = ?", (t,))
+        conn.execute(
+            "INSERT INTO task_events (task_id, kind, payload, created_at) "
+            "VALUES (?, 'block_loop_detected', '{}', 100)",
+            (t,),
+        )
+        kb.add_comment(conn, t, "dev", "rearm-approved: trust me")
+        assert kb.check_respawn_guard(conn, t) == "block_loop_frozen"
+
+
+def test_dispatch_does_not_spawn_block_loop_after_cosmetic_promotion(
+    kanban_home, all_assignees_spawnable
+):
+    spawned = []
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="looping", assignee="alice")
+        conn.execute("UPDATE tasks SET block_recurrences = 2 WHERE id = ?", (t,))
+        conn.execute(
+            "INSERT INTO task_events (task_id, kind, payload, created_at) "
+            "VALUES (?, 'block_loop_detected', '{}', 100)",
+            (t,),
+        )
+        conn.execute(
+            "INSERT INTO task_events (task_id, kind, payload, created_at) "
+            "VALUES (?, 'specified', '{}', 101)",
+            (t,),
+        )
+        result = kb.dispatch_once(
+            conn, spawn_fn=lambda task, workspace: spawned.append(task.id)
+        )
+
+    assert spawned == []
+    assert (t, "block_loop_frozen") in result.respawn_guarded
+
+
+def test_dispatch_does_not_spawn_frozen_review_task(
+    kanban_home, all_assignees_spawnable
+):
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="looping review", assignee="alice")
+        conn.execute(
+            "UPDATE tasks SET status = 'review', block_recurrences = 2 WHERE id = ?",
+            (t,),
+        )
+        conn.execute(
+            "INSERT INTO task_events (task_id, kind, payload, created_at) "
+            "VALUES (?, 'block_loop_detected', '{}', 100)",
+            (t,),
+        )
+        result = kb.dispatch_once(conn, dry_run=True)
+
+    assert all(spawned[0] != t for spawned in result.spawned)
+    assert (t, "block_loop_frozen") in result.respawn_guarded
+
+def test_claim_primitives_refuse_frozen_tasks(kanban_home):
+    with kb.connect() as conn:
+        ready = kb.create_task(conn, title="ready loop", assignee="alice")
+        review = kb.create_task(conn, title="review loop", assignee="alice")
+        conn.execute("UPDATE tasks SET status='review' WHERE id=?", (review,))
+        for task_id in (ready, review):
+            conn.execute(
+                "INSERT INTO task_events (task_id, kind, payload, created_at) "
+                "VALUES (?, 'block_loop_detected', '{}', 100)",
+                (task_id,),
+            )
+
+        assert kb.claim_task(conn, ready) is None
+        assert kb.claim_review_task(conn, review) is None
+
+        assert kb.get_task(conn, ready).status == "ready"
+        assert kb.get_task(conn, review).status == "review"
+
+
 def test_respawn_guard_none_on_fresh_task(kanban_home):
     """A fresh task with no failures or runs is not guarded."""
     with kb.connect() as conn:
@@ -3635,6 +3788,109 @@ def _make_task(**overrides) -> "kb.Task":
     )
     defaults.update(overrides)
     return kb.Task(**defaults)
+
+
+# ---------------------------------------------------------------------------
+# Kanban worker model + reasoning policy
+# ---------------------------------------------------------------------------
+
+
+def test_worker_reasoning_and_model_policy_matrix(monkeypatch):
+    """Kanban worker retries should follow the explicit cost policy matrix."""
+    from hermes_cli import config as hermes_config
+
+    monkeypatch.setattr(
+        hermes_config,
+        "load_config",
+        lambda: {
+            "kanban": {
+                "worker_model_policy": {
+                    "default_model": "gpt-5.5",
+                    "simple_model": "gpt-5.3-codex-spark",
+                    "third_attempt_model": "gpt-5.5",
+                    "third_attempt_after_failures": 2,
+                },
+                "worker_reasoning_policy": {
+                    "default_effort": "medium",
+                    "max_effort": "high",
+                },
+            }
+        },
+    )
+
+    cases = [
+        ("low", 0, "medium", "gpt-5.3-codex-spark"),
+        ("low", 1, "low", "gpt-5.5"),
+        ("low", 2, "medium", "gpt-5.5"),
+        ("medium", 0, "low", "gpt-5.5"),
+        ("medium", 1, "low", "gpt-5.5"),
+        ("medium", 2, "medium", "gpt-5.5"),
+        ("high", 0, "medium", "gpt-5.5"),
+        ("high", 1, "medium", "gpt-5.5"),
+        ("high", 2, "high", "gpt-5.5"),
+    ]
+
+    for base_effort, failures, expected_effort, expected_model in cases:
+        task = _make_task(
+            body=f"reasoning_effort: {base_effort}",
+            consecutive_failures=failures,
+        )
+        assert kb._resolve_kanban_worker_reasoning_effort(task) == expected_effort
+        assert kb._resolve_kanban_worker_model(task) == expected_model
+
+
+def test_low_card_first_attempt_falls_back_to_gpt55_low_when_spark_disabled(monkeypatch):
+    """If Spark is not configured, a low card should not spend medium thinking."""
+    from hermes_cli import config as hermes_config
+
+    monkeypatch.setattr(
+        hermes_config,
+        "load_config",
+        lambda: {
+            "kanban": {
+                "worker_model_policy": {
+                    "default_model": "gpt-5.5",
+                    "simple_model": "",
+                },
+                "worker_reasoning_policy": {
+                    "default_effort": "medium",
+                    "max_effort": "high",
+                },
+            }
+        },
+    )
+
+    task = _make_task(body="thinking_budget: low", consecutive_failures=0)
+
+    assert kb._resolve_kanban_worker_reasoning_effort(task) == "low"
+    assert kb._resolve_kanban_worker_model(task) == "gpt-5.5"
+
+
+def test_default_unmarked_card_uses_medium_policy_without_spark(monkeypatch):
+    """Unmarked cards default to medium policy: low reasoning on GPT-5.5."""
+    from hermes_cli import config as hermes_config
+
+    monkeypatch.setattr(
+        hermes_config,
+        "load_config",
+        lambda: {
+            "kanban": {
+                "worker_model_policy": {
+                    "default_model": "gpt-5.5",
+                    "simple_model": "gpt-5.3-codex-spark",
+                },
+                "worker_reasoning_policy": {
+                    "default_effort": "medium",
+                    "max_effort": "high",
+                },
+            }
+        },
+    )
+
+    task = _make_task(body="ordinary card", consecutive_failures=0)
+
+    assert kb._resolve_kanban_worker_reasoning_effort(task) == "low"
+    assert kb._resolve_kanban_worker_model(task) == "gpt-5.5"
 
 
 def test_safe_int_accepts_int_and_int_string():

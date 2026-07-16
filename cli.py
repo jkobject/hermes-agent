@@ -3896,11 +3896,16 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
             _resolve_prefill_messages_file(CLI_CONFIG)
         )
         
-        # Reasoning config (OpenRouter reasoning effort level)
-        # Per-model override > global reasoning_effort — resolved through the
-        # shared chokepoint in hermes_constants (Closes #21256).
-        from hermes_constants import resolve_reasoning_config
-        self.reasoning_config = resolve_reasoning_config(CLI_CONFIG, self.model)
+        # Reasoning config (OpenRouter reasoning effort level). Per-card Kanban
+        # effort overrides the shared per-model > global config resolution without
+        # mutating profile/global configuration.
+        _kanban_reasoning_effort = os.getenv("HERMES_KANBAN_REASONING_EFFORT", "").strip()
+        if _kanban_reasoning_effort:
+            self.reasoning_config = _parse_reasoning_config(_kanban_reasoning_effort)
+        else:
+            from hermes_constants import resolve_reasoning_config
+
+            self.reasoning_config = resolve_reasoning_config(CLI_CONFIG, self.model)
         self.service_tier = _parse_service_tier_config(
             CLI_CONFIG["agent"].get("service_tier", "")
         )

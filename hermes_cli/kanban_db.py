@@ -3386,6 +3386,8 @@ def claim_task(
     lock = claimer or _claimer_id()
     expires = now + _resolve_claim_ttl_seconds(ttl_seconds)
     with write_txn(conn):
+        if is_block_loop_frozen(conn, task_id):
+            return None
         # Structural invariant: never transition ready -> running while any
         # parent is not yet 'done'. This is the single enforcement point
         # regardless of which writer (create_task, link_tasks, unblock_task,
@@ -3515,6 +3517,8 @@ def claim_review_task(
     lock = claimer or _claimer_id()
     expires = now + _resolve_claim_ttl_seconds(ttl_seconds)
     with write_txn(conn):
+        if is_block_loop_frozen(conn, task_id):
+            return None
         cur = conn.execute(
             """
             UPDATE tasks
@@ -5049,7 +5053,7 @@ def promote_task(
 
 
 def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
-    """Transition ``blocked``/``scheduled`` -> ready or todo.
+    """Transition ``blocked``/``scheduled`` or a frozen triage task.
 
     Defensively closes any stale ``current_run_id`` pointer before flipping
     status. In the common path (``block_task`` closed the run already) this
@@ -5060,9 +5064,15 @@ def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
     """
     now = int(time.time())
     with write_txn(conn):
+        # The circuit-breaker state and the transition must share one SQLite
+        # write snapshot. Reading it before BEGIN IMMEDIATE lets a newer loop
+        # event land while this call is waiting and then be released by stale
+        # state from the previous generation.
+        frozen_triage = is_block_loop_frozen(conn, task_id)
         stale = conn.execute(
-            "SELECT current_run_id FROM tasks WHERE id = ? AND status IN ('blocked', 'scheduled')",
-            (task_id,),
+            "SELECT current_run_id FROM tasks WHERE id = ? "
+            "AND (status IN ('blocked', 'scheduled') OR (status = 'triage' AND ?))",
+            (task_id, int(frozen_triage)),
         ).fetchone()
         if stale and stale["current_run_id"]:
             conn.execute(
@@ -5102,8 +5112,9 @@ def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
         cur = conn.execute(
             "UPDATE tasks SET status = ?, current_run_id = NULL, "
             "consecutive_failures = 0, last_failure_error = NULL "
-            "WHERE id = ? AND status IN ('blocked', 'scheduled')",
-            (new_status, task_id),
+            "WHERE id = ? AND (status IN ('blocked', 'scheduled') "
+            "OR (status = 'triage' AND ?))",
+            (new_status, task_id, int(frozen_triage)),
         )
         if cur.rowcount != 1:
             return False
@@ -5122,6 +5133,7 @@ def specify_triage_task(
     body: Optional[str] = None,
     assignee: Optional[str] = None,
     author: Optional[str] = None,
+    respect_block_loop_freeze: bool = False,
 ) -> bool:
     """Flesh out a triage task and promote it to ``todo``.
 
@@ -5143,6 +5155,8 @@ def specify_triage_task(
         raise ValueError("title cannot be blank")
     assignee = _canonical_assignee(assignee)
     with write_txn(conn):
+        if respect_block_loop_freeze and is_block_loop_frozen(conn, task_id):
+            return False
         existing = conn.execute(
             "SELECT title, body, assignee FROM tasks WHERE id = ? AND status = 'triage'",
             (task_id,),
@@ -5213,6 +5227,7 @@ def decompose_triage_task(
     children: list[dict],
     author: Optional[str] = None,
     auto_promote: bool = True,
+    respect_block_loop_freeze: bool = False,
 ) -> Optional[list[str]]:
     """Fan a triage task out into child tasks and promote the root to ``todo``.
 
@@ -5297,6 +5312,8 @@ def decompose_triage_task(
     now = int(time.time())
     child_ids: list[str] = []
     with write_txn(conn):
+        if respect_block_loop_freeze and is_block_loop_frozen(conn, task_id):
+            return None
         root_row = conn.execute(
             "SELECT id, status, tenant, workspace_kind, workspace_path "
             "FROM tasks WHERE id = ?",
@@ -7133,6 +7150,29 @@ def _clear_failure_counter(conn: sqlite3.Connection, task_id: str) -> None:
 _clear_spawn_failures = _clear_failure_counter
 
 
+def is_block_loop_frozen(conn: sqlite3.Connection, task_id: str) -> bool:
+    """Return whether the block-loop breaker still forbids automation.
+
+    ``block_loop_detected`` is a circuit breaker, not merely another triage
+    reason. Once emitted, automation must not recycle the task. Only a later
+    authoritative ``unblocked`` event releases it; comments and cosmetic
+    status/body/specification events deliberately do not.
+    """
+    loop = conn.execute(
+        "SELECT MAX(id) AS event_id FROM task_events "
+        "WHERE task_id = ? AND kind = 'block_loop_detected'",
+        (task_id,),
+    ).fetchone()
+    loop_event_id = int(loop["event_id"] or 0) if loop else 0
+    if not loop_event_id:
+        return False
+    rearm = conn.execute(
+        "SELECT 1 FROM task_events WHERE task_id = ? AND kind = 'unblocked' "
+        "AND id > ? LIMIT 1",
+        (task_id, loop_event_id),
+    ).fetchone()
+    return rearm is None
+
 def check_respawn_guard(conn: sqlite3.Connection, task_id: str) -> Optional[str]:
     """Return a guard reason if ``task_id`` should NOT be re-spawned, else None.
 
@@ -7173,14 +7213,14 @@ def check_respawn_guard(conn: sqlite3.Connection, task_id: str) -> Optional[str]
 
     ``"active_pr"``
         A GitHub PR URL appears in a recent task comment (within
-        ``_RESPAWN_GUARD_PR_WINDOW`` seconds).  A prior worker already
+        ``_RESPAWN_GUARD_PR_WINDOW`` seconds). A prior worker already
         opened a PR; re-spawning risks a duplicate PR on the same task.
 
-    Stale / dead claim locks are NOT a guard reason — they are handled
-    by ``release_stale_claims`` and ``detect_crashed_workers`` which
-    reset the task to ``ready`` only after verifying the lock is
-    genuinely dead (no live PID on this host).
+    Stale / dead claim locks are handled separately by the dispatcher.
     """
+    if is_block_loop_frozen(conn, task_id):
+        return "block_loop_frozen"
+
     row = conn.execute(
         "SELECT last_failure_error FROM tasks WHERE id = ?",
         (task_id,),
@@ -7730,6 +7770,16 @@ def _dispatch_once_locked(
         if not row["assignee"]:
             result.skipped_unassigned.append(row["id"])
             continue
+        guard_reason = check_respawn_guard(conn, row["id"])
+        if guard_reason is not None:
+            result.respawn_guarded.append((row["id"], guard_reason))
+            if not dry_run:
+                with write_txn(conn):
+                    _append_event(
+                        conn, row["id"], "respawn_guarded",
+                        {"reason": guard_reason},
+                    )
+            continue
         try:
             from hermes_cli.profiles import profile_exists
         except Exception:
@@ -8021,6 +8071,130 @@ def _worker_terminal_timeout_env(
     return str(desired)
 
 
+_REASONING_EFFORT_ORDER = ("none", "low", "medium", "high")
+_REASONING_EFFORT_RE = re.compile(
+    r"(?im)^\s*(?:kanban_)?(?:reasoning_effort|thinking_budget|reasoning_budget)\s*[:=]\s*"
+    r"(none|low|medium|high)\b"
+)
+
+
+def _resolve_kanban_worker_reasoning_effort(task: Task) -> Optional[str]:
+    """Return worker reasoning effort for a dispatched Kanban task.
+
+    Operator policy (2026-06-25): orchestrators/reviewers should choose a
+    thinking budget per card by writing e.g. ``reasoning_effort: low`` or
+    ``thinking_budget: high`` in the card body. Complex/uncategorized work uses
+    the configured default. Each true failed attempt increments the budget one
+    notch (``consecutive_failures``), while review-requested mini-updates should
+    be routed as normal fix/update cards with the right explicit budget rather
+    than counted as worker failure.
+    """
+    cfg = {}
+    simple_model_available = True
+    try:
+        from hermes_cli.config import load_config
+        kanban_cfg = load_config().get("kanban") or {}
+        cfg = (kanban_cfg.get("worker_reasoning_policy") or {})
+        model_cfg = kanban_cfg.get("worker_model_policy") or {}
+        raw_simple_model = model_cfg.get("simple_model", "gpt-5.3-codex-spark")
+        simple_model_available = bool(str(raw_simple_model or "").strip())
+    except Exception:
+        cfg = {}
+
+    default_effort = str(cfg.get("default_effort") or "medium").strip().lower()
+    max_effort = str(cfg.get("max_effort") or "high").strip().lower()
+    if default_effort not in _REASONING_EFFORT_ORDER:
+        default_effort = "medium"
+    if max_effort not in _REASONING_EFFORT_ORDER:
+        max_effort = "high"
+
+    base_effort = default_effort
+    body = task.body or ""
+    match = _REASONING_EFFORT_RE.search(body)
+    if match:
+        base_effort = match.group(1).strip().lower()
+
+    try:
+        failures = max(0, int(task.consecutive_failures or 0))
+    except (TypeError, ValueError):
+        failures = 0
+
+    # Kanban worker budget policy is intentionally a matrix, not a simple
+    # monotonic "+1 notch per failure" escalation.  Cheap/simple cards get a
+    # medium Spark attempt first, then fall back to cheaper GPT-5.5 attempts;
+    # medium/high cards start one notch below their requested budget and only
+    # climb after repeated genuine worker failures.
+    if base_effort == "low":
+        if failures == 0:
+            resolved = "medium" if simple_model_available else "low"
+        else:
+            resolved = "low" if failures == 1 else "medium"
+    elif base_effort == "medium":
+        resolved = "low" if failures < 2 else "medium"
+    elif base_effort == "high":
+        resolved = "medium" if failures < 2 else "high"
+    else:
+        base_idx = _REASONING_EFFORT_ORDER.index(base_effort)
+        resolved = _REASONING_EFFORT_ORDER[min(len(_REASONING_EFFORT_ORDER) - 1, base_idx + failures)]
+
+    max_idx = _REASONING_EFFORT_ORDER.index(max_effort)
+    resolved_idx = _REASONING_EFFORT_ORDER.index(resolved)
+    return _REASONING_EFFORT_ORDER[min(max_idx, resolved_idx)]
+
+
+def _resolve_kanban_worker_model(task: Task) -> Optional[str]:
+    """Return the model override to pass to a dispatched Kanban worker.
+
+    Operator policy (2026-06-25): complex/uncategorized Kanban cards stay on
+    GPT 5.5. Orchestrators may mark cards they judge simple enough for Spark by
+    setting ``model_override`` to the configured ``simple_model``
+    (``gpt-5.3-codex-spark``). Spark-marked cards escalate to GPT 5.5 on the
+    third attempt and later. Other explicit per-card model overrides remain
+    strongest and are honoured as deliberate choices.
+
+    ``consecutive_failures`` is incremented after a failed attempt and reset on
+    successful completion, so ``2`` means the next dispatch is the third try.
+    """
+    cfg = {}
+    try:
+        from hermes_cli.config import load_config
+        cfg = ((load_config().get("kanban") or {}).get("worker_model_policy") or {})
+    except Exception:
+        cfg = {}
+
+    default_model = str(cfg.get("default_model") or "gpt-5.5").strip()
+    raw_simple_model = cfg.get("simple_model", "gpt-5.3-codex-spark")
+    simple_model = str(raw_simple_model or "").strip()
+    escalation_model = str(cfg.get("third_attempt_model") or "gpt-5.5").strip()
+    try:
+        third_attempt_after_failures = int(cfg.get("third_attempt_after_failures", 2))
+    except (TypeError, ValueError):
+        third_attempt_after_failures = 2
+
+    failures = task.consecutive_failures or 0
+    if task.model_override:
+        override = str(task.model_override).strip()
+        if override == simple_model and failures >= max(0, third_attempt_after_failures):
+            return escalation_model or default_model or simple_model or None
+        return override or None
+
+    # Complexity-coupled default: only cards explicitly marked low get a cheap
+    # Spark first attempt.  Once a low card has genuinely failed, or for any
+    # medium/high/default card, dispatch on GPT-5.5 and let the reasoning matrix
+    # above control the thinking budget.  Do not silently fall back to DeepSeek:
+    # bad cheap retries are more expensive than a correct 5.5 retry.
+    body = task.body or ""
+    match = _REASONING_EFFORT_RE.search(body)
+    base_effort = match.group(1).strip().lower() if match else None
+    try:
+        failures = max(0, int(task.consecutive_failures or 0))
+    except (TypeError, ValueError):
+        failures = 0
+    if base_effort == "low" and failures == 0:
+        return simple_model or default_model or None
+    return default_model or None
+
+
 def _resolve_worker_cli_toolsets(hermes_home: Optional[str]) -> Optional[list[str]]:
     """Return the assigned profile's effective CLI toolsets for a worker.
 
@@ -8191,8 +8365,13 @@ def _default_spawn(
         for sk in task.skills:
             if sk:
                 cmd.extend(["--skills", sk])
-    if task.model_override:
-        cmd.extend(["-m", task.model_override])
+    effective_model = _resolve_kanban_worker_model(task)
+    if effective_model:
+        cmd.extend(["-m", effective_model])
+        env["HERMES_KANBAN_WORKER_MODEL"] = effective_model
+    effective_reasoning = _resolve_kanban_worker_reasoning_effort(task)
+    if effective_reasoning:
+        env["HERMES_KANBAN_REASONING_EFFORT"] = effective_reasoning
     worker_toolsets = _resolve_worker_cli_toolsets(env.get("HERMES_HOME"))
     if worker_toolsets:
         cmd.extend(["--toolsets", ",".join(worker_toolsets)])
