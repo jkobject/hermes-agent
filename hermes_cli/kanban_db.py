@@ -7314,19 +7314,27 @@ def check_respawn_guard(conn: sqlite3.Connection, task_id: str) -> Optional[str]
     #    task/PR after review. Other transition events can be automatic or
     #    ambiguous, so they deliberately do not bypass duplicate-PR protection.
     pr_cutoff = now - _RESPAWN_GUARD_PR_WINDOW
-    for c in conn.execute(
-        "SELECT id, body, created_at FROM task_comments "
-        "WHERE task_id = ? AND created_at >= ? "
-        "ORDER BY created_at DESC, id DESC",
-        (task_id, pr_cutoff),
-    ).fetchall():
-        if c["body"] and _RESPAWN_GUARD_PR_URL_RE.search(c["body"]):
-            rearm_events = conn.execute(
-                "SELECT created_at, payload FROM task_events "
-                "WHERE task_id = ? AND kind = 'unblocked' AND created_at >= ? "
-                "ORDER BY id DESC",
-                (task_id, int(c["created_at"])),
-            ).fetchall()
+    pr_comments = [
+        c
+        for c in conn.execute(
+            "SELECT id, body, created_at FROM task_comments "
+            "WHERE task_id = ? AND created_at >= ? "
+            "ORDER BY id DESC",
+            (task_id, pr_cutoff),
+        ).fetchall()
+        if c["body"] and _RESPAWN_GUARD_PR_URL_RE.search(c["body"])
+    ]
+    if pr_comments:
+        rearm_events = conn.execute(
+            "SELECT created_at, payload FROM task_events "
+            "WHERE task_id = ? AND kind = 'unblocked' "
+            "ORDER BY id DESC",
+            (task_id,),
+        ).fetchall()
+        for c in pr_comments:
+            comment_id = int(c["id"])
+            comment_created_at = int(c["created_at"])
+            comment_rearmed = False
             for event in rearm_events:
                 try:
                     payload = json.loads(event["payload"] or "{}")
@@ -7337,15 +7345,19 @@ def check_respawn_guard(conn: sqlite3.Connection, task_id: str) -> Optional[str]
                         rearm_comment_id = int(payload["rearm_comment_id"])
                     except (TypeError, ValueError):
                         continue
-                    if rearm_comment_id >= int(c["id"]):
-                        return None
+                    if rearm_comment_id >= comment_id:
+                        comment_rearmed = True
+                        break
                     continue
                 # Legacy unblocks predate causal comment snapshots. Preserve
-                # their timestamp ordering, but never let wall-clock skew
-                # override an authoritative snapshot from newer events.
-                if int(event["created_at"]) > int(c["created_at"]):
-                    return None
-            return "active_pr"
+                # their strict timestamp ordering only for payloads that lack a
+                # snapshot; snapshot-bearing events above are authoritative
+                # across same-second operations and wall-clock skew.
+                if int(event["created_at"]) > comment_created_at:
+                    comment_rearmed = True
+                    break
+            if not comment_rearmed:
+                return "active_pr"
 
     return None
 

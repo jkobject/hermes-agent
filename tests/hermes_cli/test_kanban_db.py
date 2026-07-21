@@ -2169,6 +2169,47 @@ def test_respawn_guard_newer_pr_stays_guarded_when_clock_moves_backward(
         assert kb.check_respawn_guard(conn, t) == "active_pr"
 
 
+def test_respawn_guard_pr_after_rearm_stays_guarded_when_clock_rolls_back(
+    kanban_home, monkeypatch
+):
+    """A newer PR comment must guard even if its wall-clock timestamp is older."""
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="rollback-newer-pr", assignee="alice")
+        kb.claim_task(conn, t)
+        assert kb.block_task(conn, t, reason="review-required")
+
+        monkeypatch.setattr(kb.time, "time", lambda: 1_700_000_100)
+        kb.add_comment(conn, t, "worker", "PR A: https://github.com/acme/widgets/pull/50")
+
+        monkeypatch.setattr(kb.time, "time", lambda: 1_700_000_110)
+        assert kb.unblock_task(conn, t)
+
+        monkeypatch.setattr(kb.time, "time", lambda: 1_700_000_000)
+        kb.add_comment(conn, t, "worker", "PR B: https://github.com/acme/widgets/pull/51")
+
+        monkeypatch.setattr(kb.time, "time", lambda: 1_700_000_200)
+        assert kb.check_respawn_guard(conn, t) == "active_pr"
+
+
+def test_respawn_guard_snapshot_rearm_ignores_clock_rollback(
+    kanban_home, monkeypatch
+):
+    """Snapshot-bearing unblocks rearm causally newer comments, not newer clocks."""
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="rollback-rearm", assignee="alice")
+        kb.claim_task(conn, t)
+        assert kb.block_task(conn, t, reason="review-required")
+
+        monkeypatch.setattr(kb.time, "time", lambda: 1_700_000_100)
+        kb.add_comment(conn, t, "worker", "PR: https://github.com/acme/widgets/pull/52")
+
+        monkeypatch.setattr(kb.time, "time", lambda: 1_700_000_000)
+        assert kb.unblock_task(conn, t)
+
+        monkeypatch.setattr(kb.time, "time", lambda: 1_700_000_200)
+        assert kb.check_respawn_guard(conn, t) is None
+
+
 def test_respawn_guard_rejection_comment_without_unblock_stays_guarded(kanban_home):
     """Reviewer feedback alone does not authorize another producer run."""
     with kb.connect() as conn:
