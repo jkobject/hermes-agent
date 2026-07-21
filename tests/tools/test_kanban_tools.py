@@ -188,7 +188,7 @@ def test_show_bounds_recoverable_history_without_mutating_board(worker_env):
     from hermes_cli import kanban_db as kb
     from tools import kanban_tools as kt
 
-    core_body = "Keep this task body complete: " + ("B" * 1_000)
+    core_body = "Keep this canonical task body: " + ("B" * 1_000)
     oversized = "verbose history " + ("X" * 10_000)
     with kb.connect() as conn:
         conn.execute("UPDATE tasks SET body = ? WHERE id = ?", (core_body, worker_env))
@@ -226,7 +226,9 @@ def test_show_bounds_recoverable_history_without_mutating_board(worker_env):
     shown = json.loads(raw)
 
     assert len(raw) < 30_000
-    assert shown["task"]["body"] == core_body
+    assert shown["task"]["body"].startswith("Keep this canonical task body: ")
+    assert shown["task"]["body_truncated"] is True
+    assert shown["task"]["body_full_chars"] == len(core_body)
     assert shown["parent_handoffs"][0]["task_id"] == parent
     assert shown["parent_handoffs"][0]["summary"] == "parent handoff result"
     assert "worker_context" not in shown
@@ -244,6 +246,9 @@ def test_show_bounds_recoverable_history_without_mutating_board(worker_env):
     assert "hermes kanban log" in shown["recovery"]
 
     with kb.connect() as conn:
+        task = kb.get_task(conn, worker_env)
+        assert task is not None
+        assert task.body == core_body
         assert canonical_counts == {
             "comments": len(kb.list_comments(conn, worker_env)),
             "events": len(kb.list_events(conn, worker_env)),
@@ -313,6 +318,38 @@ def test_show_preserves_bounded_attachment_orientation(worker_env, tmp_path):
     assert "kanban_attachments" in shown["recovery"]
 
 
+def test_show_bounds_adversarial_attachment_metadata(worker_env):
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    huge = "M" * 350_000
+    with kb.connect() as conn:
+        kb.add_attachment(
+            conn,
+            worker_env,
+            filename=huge,
+            stored_path="/tmp/" + huge,
+            content_type=huge,
+            size=1,
+            uploaded_by=huge,
+        )
+
+    raw = kt._handle_show({"task_id": worker_env})
+    shown = json.loads(raw)
+    attachment = shown["attachments"][0]
+
+    assert len(raw) < 30_000
+    for field, full_chars in {
+        "filename": len(huge),
+        "stored_path": len("/tmp/" + huge),
+        "content_type": len(huge),
+        "uploaded_by": len(huge),
+    }.items():
+        assert attachment[f"{field}_truncated"] is True
+        assert attachment[f"{field}_full_chars"] == full_chars
+    assert "kanban_attachments" in shown["recovery"]
+
+
 def test_show_explicit_task_id(worker_env):
     """Peek at a different task than the one in env."""
     from hermes_cli import kanban_db as kb
@@ -342,6 +379,18 @@ def test_repeated_recoverable_data_outputs_stay_below_incident_scale(
             "UPDATE tasks SET body = ? WHERE id = ?",
             ("incident task specification " + ("B" * 10_000), worker_env),
         )
+        for attachment_index in range(10):
+            spec_path = tmp_path / f"spec-{attachment_index}.txt"
+            spec_path.write_text("acceptance criteria")
+            kb.add_attachment(
+                conn,
+                worker_env,
+                filename=spec_path.name,
+                stored_path=str(spec_path),
+                content_type="text/plain",
+                size=spec_path.stat().st_size,
+                uploaded_by="tester",
+            )
         for i in range(20):
             kb.add_comment(conn, worker_env, "peer", f"comment-{i} {oversized}")
         for i in range(8):
@@ -376,7 +425,19 @@ def test_repeated_recoverable_data_outputs_stay_below_incident_scale(
     all_outputs = show_outputs + search_outputs
 
     assert all(json.loads(output) for output in all_outputs)
-    assert sum(map(len, all_outputs)) < 300_000
+    aggregate_chars = sum(map(len, all_outputs))
+    assert aggregate_chars < 290_000, aggregate_chars
+
+
+def test_show_schema_describes_bounded_orientation_and_recovery():
+    from tools import kanban_tools as kt
+
+    description = kt.KANBAN_SHOW_SCHEMA["description"].lower()
+
+    assert "complete core task body" not in description
+    assert "bounded" in description
+    assert "attachment" in description
+    assert "recovery" in description
 
 
 def test_list_filters_tasks(monkeypatch, worker_env):

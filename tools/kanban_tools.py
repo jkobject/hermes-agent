@@ -52,11 +52,11 @@ KANBAN_LIST_MAX_LIMIT = 200
 # canonical board log. Bound verbose task fields and recoverable history so
 # repeated polling cannot rebuild hundreds of KB of context.
 _KANBAN_SHOW_MAX_COMMENTS = 3
-_KANBAN_SHOW_MAX_EVENTS = 8
+_KANBAN_SHOW_MAX_EVENTS = 5
 _KANBAN_SHOW_MAX_RUNS = 3
 _KANBAN_SHOW_MAX_PARENT_HANDOFFS = 10
-_KANBAN_SHOW_MAX_ATTACHMENTS = 10
-_KANBAN_SHOW_BODY_PREVIEW_CHARS = 1_200
+_KANBAN_SHOW_MAX_ATTACHMENTS = 3
+_KANBAN_SHOW_BODY_PREVIEW_CHARS = 500
 _KANBAN_SHOW_FIELD_PREVIEW_CHARS = 300
 
 
@@ -514,15 +514,16 @@ def _handle_show(args: dict, **kw) -> str:
                 return entry
 
             def _attachment_dict(a):
-                return {
+                entry = {
                     "id": a.id,
-                    "filename": a.filename,
-                    "stored_path": a.stored_path,
-                    "content_type": a.content_type,
                     "size": a.size,
-                    "uploaded_by": a.uploaded_by,
                     "created_at": a.created_at,
                 }
+                _put_bounded_text(entry, "filename", a.filename)
+                _put_bounded_text(entry, "stored_path", a.stored_path)
+                _put_bounded_text(entry, "content_type", a.content_type)
+                _put_bounded_text(entry, "uploaded_by", a.uploaded_by)
+                return entry
 
             parent_handoffs = []
             for parent_id in parents:
@@ -1537,11 +1538,11 @@ def _board_schema_prop() -> dict[str, str]:
 KANBAN_SHOW_SCHEMA = {
     "name": "kanban_show",
     "description": (
-        "Read a task's model-facing orientation view — the complete core task "
-        "body, parent handoffs, latest attempts/comments/events, and explicit "
-        "omitted counts plus recovery instructions for bounded history. Use this "
-        "to (re)orient yourself before starting work, especially on retries. "
-        "Canonical board data is never changed or silently byte-truncated."
+        "Read a task's bounded model-facing orientation view: task-field previews, "
+        "latest attachment metadata and parent handoffs, recent attempts/comments/"
+        "events, explicit truncation and omitted counts, and recovery instructions "
+        "for canonical board data. Use this to (re)orient yourself before starting "
+        "work, especially on retries. Canonical board data is never changed."
     ),
     "parameters": {
         "type": "object",
