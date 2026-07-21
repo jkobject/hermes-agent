@@ -5118,9 +5118,18 @@ def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
         )
         if cur.rowcount != 1:
             return False
+        latest_comment = conn.execute(
+            "SELECT MAX(id) AS id FROM task_comments WHERE task_id = ?",
+            (task_id,),
+        ).fetchone()
+        event_payload: dict[str, Any] = {
+            "rearm_comment_id": int(latest_comment["id"] or 0),
+        }
+        if new_status != "ready":
+            event_payload["status"] = new_status
         _append_event(
             conn, task_id, "unblocked",
-            {"status": new_status} if new_status != "ready" else None,
+            event_payload,
         )
         return True
 
@@ -7215,6 +7224,10 @@ def check_respawn_guard(conn: sqlite3.Connection, task_id: str) -> Optional[str]
         A GitHub PR URL appears in a recent task comment (within
         ``_RESPAWN_GUARD_PR_WINDOW`` seconds). A prior worker already
         opened a PR; re-spawning risks a duplicate PR on the same task.
+        Bypassed only when an explicit ``unblocked`` event occurs after the
+        newest PR-bearing comment, deliberately rearming that same task/PR.
+        The event records a comment-ID snapshot so same-second operations keep
+        causal ordering. Automatic or ambiguous transitions remain guarded.
 
     Stale / dead claim locks are handled separately by the dispatcher.
     """
@@ -7297,12 +7310,41 @@ def check_respawn_guard(conn: sqlite3.Connection, task_id: str) -> Optional[str]
             return "recent_success"
 
     # 4. GitHub PR URL in a recent comment — prior worker already opened a PR.
+    #    A later unblock is an authoritative request to continue that same
+    #    task/PR after review. Other transition events can be automatic or
+    #    ambiguous, so they deliberately do not bypass duplicate-PR protection.
     pr_cutoff = now - _RESPAWN_GUARD_PR_WINDOW
     for c in conn.execute(
-        "SELECT body FROM task_comments WHERE task_id = ? AND created_at >= ?",
+        "SELECT id, body, created_at FROM task_comments "
+        "WHERE task_id = ? AND created_at >= ? "
+        "ORDER BY created_at DESC, id DESC",
         (task_id, pr_cutoff),
     ).fetchall():
         if c["body"] and _RESPAWN_GUARD_PR_URL_RE.search(c["body"]):
+            rearm_events = conn.execute(
+                "SELECT created_at, payload FROM task_events "
+                "WHERE task_id = ? AND kind = 'unblocked' AND created_at >= ? "
+                "ORDER BY id DESC",
+                (task_id, int(c["created_at"])),
+            ).fetchall()
+            for event in rearm_events:
+                try:
+                    payload = json.loads(event["payload"] or "{}")
+                except (TypeError, json.JSONDecodeError):
+                    payload = {}
+                if "rearm_comment_id" in payload:
+                    try:
+                        rearm_comment_id = int(payload["rearm_comment_id"])
+                    except (TypeError, ValueError):
+                        continue
+                    if rearm_comment_id >= int(c["id"]):
+                        return None
+                    continue
+                # Legacy unblocks predate causal comment snapshots. Preserve
+                # their timestamp ordering, but never let wall-clock skew
+                # override an authoritative snapshot from newer events.
+                if int(event["created_at"]) > int(c["created_at"]):
+                    return None
             return "active_pr"
 
     return None

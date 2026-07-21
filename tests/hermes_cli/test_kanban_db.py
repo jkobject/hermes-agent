@@ -2082,6 +2082,133 @@ def test_respawn_guard_active_pr_in_comment(kanban_home):
     assert reason == "active_pr"
 
 
+def test_respawn_guard_active_pr_bypassed_by_later_unblock(kanban_home):
+    """A later unblock deliberately rearms work on the existing task/PR."""
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="retry-existing-pr", assignee="alice")
+        now = int(time.time())
+        conn.execute(
+            "INSERT INTO task_comments (task_id, author, body, created_at) "
+            "VALUES (?, 'worker', ?, ?)",
+            (t, "PR: https://github.com/acme/widgets/pull/42", now - 20),
+        )
+        conn.execute(
+            "INSERT INTO task_events (task_id, kind, created_at) "
+            "VALUES (?, 'unblocked', ?)",
+            (t, now - 10),
+        )
+
+        assert kb.check_respawn_guard(conn, t) is None
+
+
+def test_respawn_guard_newer_pr_after_unblock_is_guarded(kanban_home):
+    """A PR submission after rearm restores duplicate-PR protection."""
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="newer-pr", assignee="alice")
+        now = int(time.time())
+        conn.execute(
+            "INSERT INTO task_events (task_id, kind, created_at) "
+            "VALUES (?, 'unblocked', ?)",
+            (t, now - 20),
+        )
+        conn.execute(
+            "INSERT INTO task_comments (task_id, author, body, created_at) "
+            "VALUES (?, 'worker', ?, ?)",
+            (t, "PR: https://github.com/acme/widgets/pull/43", now - 10),
+        )
+
+        assert kb.check_respawn_guard(conn, t) == "active_pr"
+
+
+def test_respawn_guard_same_second_pr_then_unblock_is_rearmed(
+    kanban_home, monkeypatch
+):
+    """Comment IDs preserve causal order when timestamps have equal seconds."""
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="same-second-retry", assignee="alice")
+        kb.claim_task(conn, t)
+        assert kb.block_task(conn, t, reason="review-required")
+        monkeypatch.setattr(kb.time, "time", lambda: 1_700_000_000)
+
+        kb.add_comment(conn, t, "worker", "PR: https://github.com/acme/widgets/pull/47")
+        assert kb.unblock_task(conn, t)
+
+        assert kb.check_respawn_guard(conn, t) is None
+
+
+def test_respawn_guard_same_second_unblock_then_newer_pr_is_guarded(
+    kanban_home, monkeypatch
+):
+    """A same-second PR newer than the unblock snapshot restores the guard."""
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="same-second-new-pr", assignee="alice")
+        kb.claim_task(conn, t)
+        assert kb.block_task(conn, t, reason="review-required")
+        monkeypatch.setattr(kb.time, "time", lambda: 1_700_000_000)
+
+        assert kb.unblock_task(conn, t)
+        kb.add_comment(conn, t, "worker", "PR: https://github.com/acme/widgets/pull/48")
+
+        assert kb.check_respawn_guard(conn, t) == "active_pr"
+
+
+def test_respawn_guard_newer_pr_stays_guarded_when_clock_moves_backward(
+    kanban_home, monkeypatch
+):
+    """A causal comment snapshot outranks non-monotonic wall-clock time."""
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="clock-rollback", assignee="alice")
+        kb.claim_task(conn, t)
+        assert kb.block_task(conn, t, reason="review-required")
+        monkeypatch.setattr(kb.time, "time", lambda: 1_700_000_100)
+        assert kb.unblock_task(conn, t)
+
+        monkeypatch.setattr(kb.time, "time", lambda: 1_700_000_000)
+        kb.add_comment(conn, t, "worker", "PR: https://github.com/acme/widgets/pull/49")
+
+        assert kb.check_respawn_guard(conn, t) == "active_pr"
+
+
+def test_respawn_guard_rejection_comment_without_unblock_stays_guarded(kanban_home):
+    """Reviewer feedback alone does not authorize another producer run."""
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="rejected-pr", assignee="alice")
+        now = int(time.time())
+        conn.execute(
+            "INSERT INTO task_comments (task_id, author, body, created_at) "
+            "VALUES (?, 'worker', ?, ?)",
+            (t, "PR: https://github.com/acme/widgets/pull/44", now - 20),
+        )
+        conn.execute(
+            "INSERT INTO task_comments (task_id, author, body, created_at) "
+            "VALUES (?, 'reviewer', 'Changes requested', ?)",
+            (t, now - 10),
+        )
+
+        assert kb.check_respawn_guard(conn, t) == "active_pr"
+
+
+@pytest.mark.parametrize("event_kind", ["status", "promoted", "reclaimed"])
+def test_respawn_guard_non_authoritative_requeue_event_stays_guarded(
+    kanban_home, event_kind
+):
+    """Ambiguous or automatic ready transitions do not bypass active_pr."""
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="ambiguous-requeue", assignee="alice")
+        now = int(time.time())
+        conn.execute(
+            "INSERT INTO task_comments (task_id, author, body, created_at) "
+            "VALUES (?, 'worker', ?, ?)",
+            (t, "PR: https://github.com/acme/widgets/pull/45", now - 20),
+        )
+        conn.execute(
+            "INSERT INTO task_events (task_id, kind, created_at) VALUES (?, ?, ?)",
+            (t, event_kind, now - 10),
+        )
+
+        assert kb.check_respawn_guard(conn, t) == "active_pr"
+
+
 def test_respawn_guard_old_pr_comment_not_guarded(kanban_home):
     """A GitHub PR URL in a comment older than the PR window does not block."""
     with kb.connect() as conn:
@@ -2190,6 +2317,34 @@ def test_dispatch_respawn_guard_skips_active_pr(
     assert t not in res.auto_blocked
     with kb.connect() as conn:
         assert kb.get_task(conn, t).status == "ready"
+
+
+def test_dispatch_respawn_guard_allows_active_pr_after_later_unblock(
+    kanban_home, all_assignees_spawnable
+):
+    """dispatch_once spawns a deliberately rearmed task with an existing PR."""
+    spawned_ids = []
+
+    def fake_spawn(task, workspace):
+        spawned_ids.append(task.id)
+
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="retry-existing-pr", assignee="alice")
+        now = int(time.time())
+        conn.execute(
+            "INSERT INTO task_comments (task_id, author, body, created_at) "
+            "VALUES (?, 'worker', ?, ?)",
+            (t, "PR: https://github.com/acme/widgets/pull/46", now - 20),
+        )
+        conn.execute(
+            "INSERT INTO task_events (task_id, kind, created_at) "
+            "VALUES (?, 'unblocked', ?)",
+            (t, now - 10),
+        )
+        res = kb.dispatch_once(conn, spawn_fn=fake_spawn)
+
+    assert t in spawned_ids
+    assert (t, "active_pr") not in res.respawn_guarded
 
 
 def test_dispatch_respawn_guard_dry_run_no_auto_block(
