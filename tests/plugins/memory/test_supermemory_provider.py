@@ -79,6 +79,17 @@ def provider(monkeypatch, tmp_path):
     return p
 
 
+@pytest.fixture
+def capture_disabled_provider(monkeypatch, tmp_path):
+    monkeypatch.setenv("SUPERMEMORY_API_KEY", "test-key")
+    monkeypatch.setattr("plugins.memory.supermemory._SupermemoryClient", FakeClient)
+    _save_supermemory_config({"auto_capture": False}, str(tmp_path))
+    p = SupermemoryMemoryProvider()
+    p.initialize("session-1", hermes_home=str(tmp_path), platform="cli")
+    assert p._auto_capture is False
+    return p
+
+
 def test_is_available_false_without_api_key(monkeypatch):
     monkeypatch.delenv("SUPERMEMORY_API_KEY", raising=False)
     p = SupermemoryMemoryProvider()
@@ -431,6 +442,48 @@ def test_on_session_end_ingests_clean_messages(provider):
     assert payload["metadata"]["message_count"] == 2
     # Buffer is cleared after a normal session-end ingest.
     assert provider._session_turns == []
+
+
+def test_on_session_end_skips_ingest_when_auto_capture_disabled(capture_disabled_provider):
+    provider = capture_disabled_provider
+    messages = [
+        {"role": "user", "content": "temporary task status"},
+        {"role": "assistant", "content": "the task completed"},
+    ]
+
+    provider.on_session_end(messages)
+
+    assert provider._client.ingest_calls == []
+
+
+def test_on_session_switch_discards_buffer_without_ingest_when_auto_capture_disabled(capture_disabled_provider):
+    provider = capture_disabled_provider
+    provider._session_turns = [{"user": "private draft", "assistant": "temporary result"}]
+
+    provider.on_session_switch("session-2", reset=True)
+
+    assert provider._client.ingest_calls == []
+    assert provider._session_turns == []
+    assert provider._session_id == "session-2"
+
+
+def test_shutdown_skips_buffered_ingest_when_auto_capture_disabled(capture_disabled_provider):
+    provider = capture_disabled_provider
+    provider._session_turns = [{"user": "private draft", "assistant": "temporary result"}]
+
+    provider.shutdown()
+
+    assert provider._client.ingest_calls == []
+
+
+def test_auto_capture_disabled_keeps_explicit_memory_writes(capture_disabled_provider):
+    provider = capture_disabled_provider
+
+    provider.on_memory_write("add", "memory", "Jordan likes concise docs")
+    provider._write_thread.join(timeout=1)
+
+    assert len(provider._client.add_calls) == 1
+    assert provider._client.add_calls[0]["metadata"]["type"] == "explicit_memory"
 
 
 def test_merge_metadata_stamps_sm_source():
