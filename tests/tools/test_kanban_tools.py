@@ -188,7 +188,7 @@ def test_show_bounds_recoverable_history_without_mutating_board(worker_env):
     from hermes_cli import kanban_db as kb
     from tools import kanban_tools as kt
 
-    core_body = "Keep this task body complete: " + ("B" * 2_000)
+    core_body = "Keep this task body complete: " + ("B" * 1_000)
     oversized = "verbose history " + ("X" * 10_000)
     with kb.connect() as conn:
         conn.execute("UPDATE tasks SET body = ? WHERE id = ?", (core_body, worker_env))
@@ -252,6 +252,67 @@ def test_show_bounds_recoverable_history_without_mutating_board(worker_env):
         assert kb.list_comments(conn, worker_env)[-1].body.endswith("X" * 10_000)
 
 
+def test_show_bounds_task_body_with_canonical_recovery_metadata(worker_env):
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    oversized_body = "Required specification: " + ("B" * 350_000)
+    with kb.connect() as conn:
+        conn.execute(
+            "UPDATE tasks SET body = ? WHERE id = ?",
+            (oversized_body, worker_env),
+        )
+        conn.commit()
+
+    raw = kt._handle_show({"task_id": worker_env})
+    shown = json.loads(raw)
+
+    assert len(raw) < 30_000
+    assert shown["task"]["body"].startswith("Required specification: ")
+    assert shown["task"]["body_truncated"] is True
+    assert shown["task"]["body_full_chars"] == len(oversized_body)
+    assert "hermes kanban context" in shown["recovery"]
+
+    with kb.connect() as conn:
+        task = kb.get_task(conn, worker_env)
+        assert task is not None
+        assert task.body == oversized_body
+
+
+def test_show_preserves_bounded_attachment_orientation(worker_env, tmp_path):
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    spec_path = tmp_path / "spec.txt"
+    spec_path.write_text("acceptance criteria")
+    with kb.connect() as conn:
+        kb.add_attachment(
+            conn,
+            worker_env,
+            filename=spec_path.name,
+            stored_path=str(spec_path),
+            content_type="text/plain",
+            size=spec_path.stat().st_size,
+            uploaded_by="tester",
+        )
+
+    shown = json.loads(kt._handle_show({"task_id": worker_env}))
+
+    assert shown["totals"]["attachments"] == 1
+    assert shown["omitted"]["attachments"] == 0
+    assert shown["attachments"] == [{
+        "id": 1,
+        "filename": "spec.txt",
+        "stored_path": str(spec_path),
+        "content_type": "text/plain",
+        "size": len("acceptance criteria"),
+        "uploaded_by": "tester",
+        "created_at": shown["attachments"][0]["created_at"],
+    }]
+    assert "attachments" in shown["orientation"]["read_order"]
+    assert "kanban_attachments" in shown["recovery"]
+
+
 def test_show_explicit_task_id(worker_env):
     """Peek at a different task than the one in env."""
     from hermes_cli import kanban_db as kb
@@ -277,6 +338,10 @@ def test_repeated_recoverable_data_outputs_stay_below_incident_scale(
 
     oversized = "incident payload " + ("Z" * 80_000)
     with kb.connect() as conn:
+        conn.execute(
+            "UPDATE tasks SET body = ? WHERE id = ?",
+            ("incident task specification " + ("B" * 10_000), worker_env),
+        )
         for i in range(20):
             kb.add_comment(conn, worker_env, "peer", f"comment-{i} {oversized}")
         for i in range(8):
@@ -1641,6 +1706,12 @@ def test_kanban_guidance_in_worker_prompt(monkeypatch, tmp_path):
     assert "kanban_complete" in prompt
     assert "kanban_block" in prompt
     assert "kanban_create" in prompt
+    assert "bounded latest slices" in prompt
+    assert "omitted counts" in prompt
+    assert "kanban_attachments" in prompt
+    assert "hermes kanban context" in prompt
+    assert "full comment thread" not in prompt
+    assert "pre-formatted `worker_context`" not in prompt
     # Anti-shell guidance
     assert "Do not shell out" in prompt or "tools — they work" in prompt
 

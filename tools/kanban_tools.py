@@ -49,13 +49,15 @@ KANBAN_LIST_DEFAULT_LIMIT = 50
 KANBAN_LIST_MAX_LIMIT = 200
 
 # Model-facing kanban_show is an orientation view, not a replacement for the
-# canonical board log. Keep the core task row complete, but bound recoverable
-# history so repeated polling cannot rebuild hundreds of KB of context.
+# canonical board log. Bound verbose task fields and recoverable history so
+# repeated polling cannot rebuild hundreds of KB of context.
 _KANBAN_SHOW_MAX_COMMENTS = 3
 _KANBAN_SHOW_MAX_EVENTS = 8
 _KANBAN_SHOW_MAX_RUNS = 3
 _KANBAN_SHOW_MAX_PARENT_HANDOFFS = 10
-_KANBAN_SHOW_FIELD_PREVIEW_CHARS = 450
+_KANBAN_SHOW_MAX_ATTACHMENTS = 10
+_KANBAN_SHOW_BODY_PREVIEW_CHARS = 1_200
+_KANBAN_SHOW_FIELD_PREVIEW_CHARS = 300
 
 
 def _bounded_preview(value: str, limit: int = _KANBAN_SHOW_FIELD_PREVIEW_CHARS) -> tuple[str, Optional[int]]:
@@ -67,12 +69,18 @@ def _bounded_preview(value: str, limit: int = _KANBAN_SHOW_FIELD_PREVIEW_CHARS) 
     return value[:prefix_chars] + marker, len(value)
 
 
-def _put_bounded_text(target: dict[str, Any], key: str, value: Optional[str]) -> None:
+def _put_bounded_text(
+    target: dict[str, Any],
+    key: str,
+    value: Optional[str],
+    *,
+    limit: int = _KANBAN_SHOW_FIELD_PREVIEW_CHARS,
+) -> None:
     """Store a text field with explicit recovery metadata when it is verbose."""
     if value is None:
         target[key] = None
         return
-    preview, full_chars = _bounded_preview(str(value))
+    preview, full_chars = _bounded_preview(str(value), limit=limit)
     target[key] = preview
     if full_chars is not None:
         target[f"{key}_truncated"] = True
@@ -448,23 +456,32 @@ def _handle_show(args: dict, **kw) -> str:
             all_comments = kb.list_comments(conn, tid)
             all_events = kb.list_events(conn, tid)
             all_runs = kb.list_runs(conn, tid)
+            all_attachments = kb.list_attachments(conn, tid)
             parents = kb.parent_ids(conn, tid)
             children = kb.child_ids(conn, tid)
 
             def _task_dict(t):
-                return {
-                    "id": t.id, "title": t.title, "body": t.body,
+                entry = {
+                    "id": t.id,
                     "assignee": t.assignee, "status": t.status,
                     "tenant": t.tenant, "priority": t.priority,
                     "workspace_kind": t.workspace_kind,
-                    "workspace_path": t.workspace_path,
                     "created_by": t.created_by, "created_at": t.created_at,
                     "started_at": t.started_at,
                     "completed_at": t.completed_at,
-                    "result": t.result,
                     "current_run_id": t.current_run_id,
                     "model_override": t.model_override,
                 }
+                _put_bounded_text(entry, "title", t.title)
+                _put_bounded_text(
+                    entry,
+                    "body",
+                    t.body,
+                    limit=_KANBAN_SHOW_BODY_PREVIEW_CHARS,
+                )
+                _put_bounded_text(entry, "workspace_path", t.workspace_path)
+                _put_bounded_text(entry, "result", t.result)
+                return entry
 
             def _comment_dict(c):
                 entry = {
@@ -496,6 +513,17 @@ def _handle_show(args: dict, **kw) -> str:
                 _put_bounded_json(entry, "metadata", r.metadata)
                 return entry
 
+            def _attachment_dict(a):
+                return {
+                    "id": a.id,
+                    "filename": a.filename,
+                    "stored_path": a.stored_path,
+                    "content_type": a.content_type,
+                    "size": a.size,
+                    "uploaded_by": a.uploaded_by,
+                    "created_at": a.created_at,
+                }
+
             parent_handoffs = []
             for parent_id in parents:
                 parent = kb.get_task(conn, parent_id)
@@ -526,11 +554,13 @@ def _handle_show(args: dict, **kw) -> str:
             shown_comments = all_comments[-_KANBAN_SHOW_MAX_COMMENTS:]
             shown_events = all_events[-_KANBAN_SHOW_MAX_EVENTS:]
             shown_runs = all_runs[-_KANBAN_SHOW_MAX_RUNS:]
+            shown_attachments = all_attachments[-_KANBAN_SHOW_MAX_ATTACHMENTS:]
             omitted = {
                 "parent_handoffs": len(parent_handoffs) - len(shown_parent_handoffs),
                 "comments": len(all_comments) - len(shown_comments),
                 "events": len(all_events) - len(shown_events),
                 "runs": len(all_runs) - len(shown_runs),
+                "attachments": len(all_attachments) - len(shown_attachments),
             }
 
             return json.dumps({
@@ -538,6 +568,7 @@ def _handle_show(args: dict, **kw) -> str:
                 "parents": parents,
                 "children": children,
                 "parent_handoffs": shown_parent_handoffs,
+                "attachments": [_attachment_dict(a) for a in shown_attachments],
                 "comments": [_comment_dict(c) for c in shown_comments],
                 "events": [_event_dict(e) for e in shown_events],
                 "runs": [_run_dict(r) for r in shown_runs],
@@ -546,22 +577,27 @@ def _handle_show(args: dict, **kw) -> str:
                     "comments": len(all_comments),
                     "events": len(all_events),
                     "runs": len(all_runs),
+                    "attachments": len(all_attachments),
                 },
                 "omitted": omitted,
                 "orientation": {
                     "task_id": tid,
                     "read_order": [
-                        "task", "parent_handoffs", "runs", "comments", "events"
+                        "task", "attachments", "parent_handoffs", "runs",
+                        "comments", "events"
                     ],
                     "note": (
-                        "The task body is complete. Recoverable history uses bounded "
-                        "latest slices in chronological order; omitted counts are explicit."
+                        "Verbose task fields and recoverable history use bounded latest "
+                        "slices in chronological order; truncation metadata and omitted "
+                        "counts are explicit."
                     ),
                 },
                 "recovery": (
                     f"Canonical board data is unchanged. For complete history outside "
-                    f"the bounded model-tool view, use `hermes kanban show {tid} --json`, "
-                    f"`hermes kanban runs {tid}`, or `hermes kanban log {tid}` / the dashboard."
+                    f"the bounded model-tool view, use `hermes kanban context {tid}`, "
+                    f"`hermes kanban show {tid} --json`, `hermes kanban runs {tid}`, or "
+                    f"`hermes kanban log {tid}` / the dashboard. Use the "
+                    f"`kanban_attachments` tool for the complete attachment manifest."
                 ),
             }, ensure_ascii=False)
         finally:
