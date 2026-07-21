@@ -195,6 +195,19 @@ class TestWriteFileSizeLimit:
 class TestHandPlacedSkillsNoLimit:
     """Skills dropped directly on disk are not constrained."""
 
+    def test_skill_view_policy_is_complete_not_paginated(self):
+        """Instructional content relies on persistence/compression, not lazy reads."""
+        from tools.skills_tool import SKILL_VIEW_SCHEMA
+
+        properties = SKILL_VIEW_SCHEMA["parameters"]["properties"]
+        description = SKILL_VIEW_SCHEMA["description"].lower()
+
+        assert "offset" not in properties
+        assert "limit" not in properties
+        assert "not paginated" in description
+        assert "output persistence" in description
+        assert "context compression" in description
+
     def test_oversized_handplaced_skill_loads(self, isolate_skills, tmp_path):
         """A hand-placed 200k skill can still be read via skill_view."""
         from tools.skills_tool import skill_view

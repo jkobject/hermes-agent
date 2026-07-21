@@ -3615,6 +3615,34 @@ class TestCooldownReentryAbort:
         assert c._last_compress_aborted is True
         assert c._last_summary_fallback_used is False
 
+    def test_server_disconnected_summary_call_preserves_messages(self):
+        """httpx's plain RemoteProtocolError text must abort compression safely."""
+        class RemoteProtocolError(Exception):
+            pass
+
+        with patch("agent.context_compressor.get_model_context_length", return_value=100000):
+            c = ContextCompressor(
+                model="test",
+                quiet_mode=True,
+                protect_first_n=2,
+                protect_last_n=2,
+                abort_on_summary_failure=False,
+            )
+        msgs = self._msgs(12)
+
+        with patch(
+            "agent.context_compressor.call_llm",
+            side_effect=RemoteProtocolError(
+                "Server disconnected without sending a response."
+            ),
+        ):
+            result = c.compress(msgs, current_tokens=999999, force=True)
+
+        assert result == msgs
+        assert c._last_compress_aborted is True
+        assert c._last_summary_network_failure is True
+        assert c._last_summary_fallback_used is False
+
     def test_auth_failure_cooldown_reentry_still_aborts(self):
         """Same re-entry hole for auth failures: a 401 sets the flag, cooldown
         returns None, second compress must still abort."""

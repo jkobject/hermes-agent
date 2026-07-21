@@ -180,8 +180,76 @@ def test_show_defaults_to_env_task_id(worker_env):
     assert "task" in d
     assert d["task"]["id"] == worker_env
     assert d["task"]["status"] == "running"
-    assert "worker_context" in d
+    assert "orientation" in d
     assert "runs" in d
+
+
+def test_show_bounds_recoverable_history_without_mutating_board(worker_env):
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    core_body = "Keep this task body complete: " + ("B" * 2_000)
+    oversized = "verbose history " + ("X" * 10_000)
+    with kb.connect() as conn:
+        conn.execute("UPDATE tasks SET body = ? WHERE id = ?", (core_body, worker_env))
+        parent = kb.create_task(conn, title="upstream", assignee="peer")
+        conn.execute(
+            "UPDATE tasks SET status = 'done', result = ? WHERE id = ?",
+            ("parent handoff result", parent),
+        )
+        conn.execute(
+            "INSERT INTO task_links (parent_id, child_id) VALUES (?, ?)",
+            (parent, worker_env),
+        )
+        for i in range(20):
+            kb.add_comment(conn, worker_env, "peer", f"comment-{i} {oversized}")
+        for i in range(8):
+            conn.execute(
+                "INSERT INTO task_runs "
+                "(task_id, profile, status, started_at, ended_at, outcome, "
+                "summary, metadata, error) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    worker_env, "test-worker", "crashed", 100 + i, 101 + i,
+                    "crashed", f"summary-{i} {oversized}",
+                    json.dumps({"detail": f"metadata-{i} {oversized}"}),
+                    f"error-{i} {oversized}",
+                ),
+            )
+        conn.commit()
+        canonical_counts = {
+            "comments": len(kb.list_comments(conn, worker_env)),
+            "events": len(kb.list_events(conn, worker_env)),
+            "runs": len(kb.list_runs(conn, worker_env)),
+        }
+
+    raw = kt._handle_show({"task_id": worker_env})
+    shown = json.loads(raw)
+
+    assert len(raw) < 30_000
+    assert shown["task"]["body"] == core_body
+    assert shown["parent_handoffs"][0]["task_id"] == parent
+    assert shown["parent_handoffs"][0]["summary"] == "parent handoff result"
+    assert "worker_context" not in shown
+    assert shown["orientation"]["task_id"] == worker_env
+    assert shown["omitted"]["comments"] > 0
+    assert shown["omitted"]["events"] > 0
+    assert shown["omitted"]["runs"] > 0
+    assert shown["comments"][-1]["body"].startswith("comment-19")
+    assert shown["comments"][-1]["body_truncated"] is True
+    assert shown["runs"][-1]["status"] == "running"
+    assert any(
+        run.get("summary", "").startswith("summary-7") for run in shown["runs"]
+    )
+    assert "hermes kanban show" in shown["recovery"]
+    assert "hermes kanban log" in shown["recovery"]
+
+    with kb.connect() as conn:
+        assert canonical_counts == {
+            "comments": len(kb.list_comments(conn, worker_env)),
+            "events": len(kb.list_events(conn, worker_env)),
+            "runs": len(kb.list_runs(conn, worker_env)),
+        }
+        assert kb.list_comments(conn, worker_env)[-1].body.endswith("X" * 10_000)
 
 
 def test_show_explicit_task_id(worker_env):
@@ -196,6 +264,54 @@ def test_show_explicit_task_id(worker_env):
     out = kt._handle_show({"task_id": other})
     d = json.loads(out)
     assert d["task"]["id"] == other
+
+
+def test_repeated_recoverable_data_outputs_stay_below_incident_scale(
+    worker_env, tmp_path
+):
+    """Regression for polling that rebuilt context after successful compression."""
+    from hermes_cli import kanban_db as kb
+    from hermes_state import SessionDB
+    from tools import kanban_tools as kt
+    from tools.session_search_tool import session_search
+
+    oversized = "incident payload " + ("Z" * 80_000)
+    with kb.connect() as conn:
+        for i in range(20):
+            kb.add_comment(conn, worker_env, "peer", f"comment-{i} {oversized}")
+        for i in range(8):
+            conn.execute(
+                "INSERT INTO task_runs "
+                "(task_id, profile, status, started_at, ended_at, outcome, "
+                "summary, metadata, error) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    worker_env, "test-worker", "crashed", 100 + i, 101 + i,
+                    "crashed", f"summary-{i} {oversized}",
+                    json.dumps({"detail": f"metadata-{i} {oversized}"}),
+                    f"error-{i} {oversized}",
+                ),
+            )
+        conn.commit()
+
+    session_db = SessionDB(tmp_path / "incident-state.db")
+    session_db.create_session("incident-session", source="cli")
+    session_db.append_message("incident-session", role="user", content="start")
+    session_db.append_message(
+        "incident-session", role="assistant", content=oversized
+    )
+    session_db.append_message("incident-session", role="user", content="end")
+
+    show_outputs = [
+        kt._handle_show({"task_id": worker_env}) for _ in range(28)
+    ]
+    search_outputs = [
+        session_search(session_id="incident-session", db=session_db)
+        for _ in range(7)
+    ]
+    all_outputs = show_outputs + search_outputs
+
+    assert all(json.loads(output) for output in all_outputs)
+    assert sum(map(len, all_outputs)) < 300_000
 
 
 def test_list_filters_tasks(monkeypatch, worker_env):

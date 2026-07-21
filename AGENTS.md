@@ -110,7 +110,9 @@ conservative at the waist.
   mount, not the toolset.
 - **Lazy-reading escape hatches on instructional tools.** No `offset`/`limit`
   pagination on tools that load content the agent must read fully (skills,
-  prompts, playbooks). Models will read page 1 and skip the rest.
+  prompts, playbooks). Models will read page 1 and skip the rest. Instructional
+  outputs stay complete; context safety comes from durable output persistence
+  and context compression, not lazy skill reading.
 - **"Fixes" that destroy the feature they secure.** A mitigation that kills the
   feature's purpose is the wrong mitigation. Read the original commit's intent
   (`git log -p -S`) before restricting behavior; find a fix that preserves the

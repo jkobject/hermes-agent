@@ -20,7 +20,8 @@ mode parameter):
 
 All three modes operate on the SQLite session DB via the FTS5 index and
 the get_anchored_view / get_messages_around primitives in hermes_state.
-No LLM calls anywhere — every shape returns actual messages from the DB.
+No LLM calls anywhere — every shape returns actual message rows from the DB,
+with bounded content previews for oversized individual messages.
 
 History: PR #20238 (JabberELF) seeded a fast/summary dual-mode split; the
 toolkit expansion in PR #26419 (yoniebans) added the anchored drill-down,
@@ -54,6 +55,26 @@ _DEMOTED_SESSION_SOURCES = ("cron",)
 # interactive matches buried under a wall of cron hits, so this is well above
 # the handful of distinct sessions a typical query returns.
 _DISCOVER_SCAN_LIMIT = 300
+
+# session_search is a recall/navigation surface, not a bulk transcript export.
+# Keep each stored message recoverable by id while preventing one historical
+# tool result from rebuilding the active model context. This is intentionally
+# an internal policy constant rather than a user-facing environment variable.
+_MESSAGE_CONTENT_PREVIEW_CHARS = 12_000
+
+
+def _preview_message_content(content: Any) -> tuple[Any, Optional[int]]:
+    """Return content unchanged, or a bounded preview plus its original size."""
+    if not isinstance(content, str) or len(content) <= _MESSAGE_CONTENT_PREVIEW_CHARS:
+        return content, None
+
+    marker = (
+        "\n\n[session_search preview truncated; full content is "
+        f"{len(content):,} chars. Canonical content remains stored; locate it "
+        "with this session_id and message id, or inspect the original source.]"
+    )
+    prefix_chars = max(0, _MESSAGE_CONTENT_PREVIEW_CHARS - len(marker))
+    return content[:prefix_chars] + marker, len(content)
 
 
 def _format_timestamp(ts: Union[int, float, str, None]) -> str:
@@ -122,12 +143,16 @@ def _order_for_recall(raw_results: List[Dict[str, Any]]) -> List[Dict[str, Any]]
 
 def _shape_message(m: Dict[str, Any], anchor_id: Optional[int] = None) -> Dict[str, Any]:
     """Slim a message row for the tool response. Keeps content even if empty."""
+    content, full_content_chars = _preview_message_content(m.get("content"))
     entry = {
         "id": m.get("id"),
         "role": m.get("role"),
-        "content": m.get("content"),
+        "content": content,
         "timestamp": m.get("timestamp"),
     }
+    if full_content_chars is not None:
+        entry["content_truncated"] = True
+        entry["full_content_chars"] = full_content_chars
     if m.get("tool_name"):
         entry["tool_name"] = m.get("tool_name")
     if m.get("tool_calls"):
@@ -797,7 +822,9 @@ SESSION_SEARCH_SCHEMA = {
         "     Dumps the whole session by id (first 20 + last 10 messages when "
         "large). This is how you resolve an `@session:<profile>/<id>` link the "
         "user dropped into the chat: split the value on `/` into profile + id "
-        "and call session_search(session_id=id, profile=profile).\n\n"
+        "and call session_search(session_id=id, profile=profile). Oversized "
+        "individual message content is returned as a bounded preview with its "
+        "message id and original character count.\n\n"
         "  4) BROWSE — no args:\n"
         "     session_search()\n"
         "     Returns recent sessions chronologically: titles, previews, timestamps. "

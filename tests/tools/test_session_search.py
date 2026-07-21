@@ -182,6 +182,58 @@ class TestDiscoveryShape:
             window_ids = [m["id"] for m in hit["messages"]]
             assert anchor_id in window_ids
 
+    def test_oversized_message_preview_is_recoverably_bounded(self, db):
+        db.create_session("s_oversized", source="cli")
+        db.append_message("s_oversized", role="user", content="start")
+        original = "context-overflow needle " + ("A" * 80_000)
+        message_id = db.append_message(
+            "s_oversized", role="assistant", content=original
+        )
+        db.append_message("s_oversized", role="user", content="finish")
+        db._conn.commit()
+
+        discovery = json.loads(session_search(
+            query="context-overflow", db=db
+        ))
+        hit = discovery["results"][0]
+        scroll = json.loads(session_search(
+            session_id="s_oversized",
+            around_message_id=message_id,
+            window=1,
+            db=db,
+        ))
+        read = json.loads(session_search(session_id="s_oversized", db=db))
+
+        for session_id, messages in (
+            (hit["session_id"], hit["messages"]),
+            (scroll["session_id"], scroll["messages"]),
+            (read["session_id"], read["messages"]),
+        ):
+            preview = next(m for m in messages if m["id"] == message_id)
+            assert preview["content_truncated"] is True
+            assert preview["full_content_chars"] == len(original)
+            assert len(preview["content"]) <= 12_000
+            assert preview["content"].startswith("context-overflow needle")
+            assert "session_search preview truncated" in preview["content"]
+            assert session_id == "s_oversized"
+
+        # The canonical DB row remains complete and recoverable by session/message ids.
+        stored = next(m for m in db.get_messages("s_oversized") if m["id"] == message_id)
+        assert stored["content"] == original
+
+    def test_small_message_content_shape_is_unchanged(self, db):
+        db.create_session("s_small", source="cli")
+        message_id = db.append_message(
+            "s_small", role="user", content="small content exactly"
+        )
+
+        result = json.loads(session_search(session_id="s_small", db=db))
+        message = next(m for m in result["messages"] if m["id"] == message_id)
+
+        assert message["content"] == "small content exactly"
+        assert "content_truncated" not in message
+        assert "full_content_chars" not in message
+
     def test_no_results_returns_empty_list(self, db):
         _seed_modpack_sessions(db)
         result = json.loads(session_search(query="zzz_no_such_term_zzz", db=db))

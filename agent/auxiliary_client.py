@@ -3170,6 +3170,7 @@ def _is_connection_error(exc: Exception) -> bool:
         # See issue #18458.
         "incomplete chunked read",
         "peer closed connection",
+        "server disconnected",
         "response ended prematurely",
         "unexpected eof",
         "remoteprotocolerror",
