@@ -2210,6 +2210,44 @@ def test_respawn_guard_snapshot_rearm_ignores_clock_rollback(
         assert kb.check_respawn_guard(conn, t) is None
 
 
+def test_respawn_guard_malformed_unblock_payload_stays_guarded(kanban_home):
+    """A corrupt unblock payload cannot be trusted as an active-PR rearm."""
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="malformed-rearm", assignee="alice")
+        now = int(time.time())
+        conn.execute(
+            "INSERT INTO task_comments (task_id, author, body, created_at) "
+            "VALUES (?, 'worker', ?, ?)",
+            (t, "PR: https://github.com/acme/widgets/pull/53", now - 20),
+        )
+        conn.execute(
+            "INSERT INTO task_events (task_id, kind, payload, created_at) "
+            "VALUES (?, 'unblocked', ?, ?)",
+            (t, "{not json", now - 10),
+        )
+
+        assert kb.check_respawn_guard(conn, t) == "active_pr"
+
+
+def test_respawn_guard_malformed_rearm_comment_id_stays_guarded(kanban_home):
+    """A malformed snapshot is not downgraded into legacy timestamp fallback."""
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="malformed-snapshot", assignee="alice")
+        now = int(time.time())
+        conn.execute(
+            "INSERT INTO task_comments (task_id, author, body, created_at) "
+            "VALUES (?, 'worker', ?, ?)",
+            (t, "PR: https://github.com/acme/widgets/pull/54", now - 20),
+        )
+        conn.execute(
+            "INSERT INTO task_events (task_id, kind, payload, created_at) "
+            "VALUES (?, 'unblocked', ?, ?)",
+            (t, '{"rearm_comment_id": "not-an-int"}', now - 10),
+        )
+
+        assert kb.check_respawn_guard(conn, t) == "active_pr"
+
+
 def test_respawn_guard_rejection_comment_without_unblock_stays_guarded(kanban_home):
     """Reviewer feedback alone does not authorize another producer run."""
     with kb.connect() as conn:

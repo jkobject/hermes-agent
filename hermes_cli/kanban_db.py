@@ -7336,10 +7336,21 @@ def check_respawn_guard(conn: sqlite3.Connection, task_id: str) -> Optional[str]
             comment_created_at = int(c["created_at"])
             comment_rearmed = False
             for event in rearm_events:
+                raw_payload = event["payload"]
+                if raw_payload is None:
+                    legacy_without_payload = True
+                    payload_text = ""
+                elif isinstance(raw_payload, str):
+                    legacy_without_payload = raw_payload.strip() == ""
+                    payload_text = raw_payload
+                else:
+                    continue
                 try:
-                    payload = json.loads(event["payload"] or "{}")
+                    payload = {} if legacy_without_payload else json.loads(payload_text)
                 except (TypeError, json.JSONDecodeError):
-                    payload = {}
+                    continue
+                if not isinstance(payload, dict):
+                    continue
                 if "rearm_comment_id" in payload:
                     try:
                         rearm_comment_id = int(payload["rearm_comment_id"])
@@ -7349,10 +7360,12 @@ def check_respawn_guard(conn: sqlite3.Connection, task_id: str) -> Optional[str]
                         comment_rearmed = True
                         break
                     continue
+                if not legacy_without_payload:
+                    continue
                 # Legacy unblocks predate causal comment snapshots. Preserve
-                # their strict timestamp ordering only for payloads that lack a
-                # snapshot; snapshot-bearing events above are authoritative
-                # across same-second operations and wall-clock skew.
+                # their strict timestamp ordering only for events with absent
+                # payloads; malformed payloads cannot be trusted as rearm
+                # authority and fail closed.
                 if int(event["created_at"]) > comment_created_at:
                     comment_rearmed = True
                     break
