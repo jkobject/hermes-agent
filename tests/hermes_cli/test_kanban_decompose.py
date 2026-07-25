@@ -336,7 +336,6 @@ def test_auto_decompose_rechecks_freeze_after_llm_call(kanban_home):
         tid = kb.create_task(conn, title="race", triage=True, assignee="dev")
 
     payload = jsonlib.dumps({"fanout": False, "title": "rewritten", "body": "body"})
-    client = _mock_client_returning(payload)
 
     def freeze_then_return(*args, **kwargs):
         with kb.connect() as conn:
@@ -347,13 +346,12 @@ def test_auto_decompose_rechecks_freeze_after_llm_call(kanban_home):
             )
         return _fake_aux_response(payload)
 
-    client.chat.completions.create.side_effect = freeze_then_return
-    with (
-        patch(
-            "agent.auxiliary_client.get_text_auxiliary_client",
-            return_value=(client, "test-model"),
-        ),
-        _patch_extra_body(),
+    # The decomposer now routes through call_llm. Inject the concurrent freeze
+    # at that boundary so this still proves the post-LLM readback, rather than
+    # accidentally exercising the removed direct-client path.
+    with patch(
+        "agent.auxiliary_client.call_llm",
+        side_effect=freeze_then_return,
     ):
         outcome = decomp.decompose_task(tid, author="auto-decomposer", automatic=True)
 
