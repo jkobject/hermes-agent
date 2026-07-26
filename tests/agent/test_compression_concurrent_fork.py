@@ -316,33 +316,203 @@ def test_concurrent_compression_does_not_fork_session(tmp_path: Path) -> None:
     )
 
 
-def test_durable_message_committed_before_lease_aborts_stale_snapshot(
+def test_durable_messages_committed_before_lease_are_reconciled_and_compressed(
     tmp_path: Path,
 ) -> None:
-    """A durable row absent from the caller snapshot must survive in the parent."""
+    """A stale turn snapshot must adopt the durable prefix before rotation.
+
+    This is the live desktop/WebUI failure shape: the warm frontend history is
+    behind state.db, while the current user turn exists only in the live list.
+    Returning that stale list unchanged makes preflight submit an oversized
+    request; rotating from it would instead drop the durable tool exchange.
+    """
     db = SessionDB(db_path=tmp_path / "state.db")
     parent_sid = "PRE_LEASE_DURABLE_RACE"
     db.create_session(parent_sid, source="webui")
     db.append_message(parent_sid, "user", "old durable")
+    db.append_message(
+        parent_sid,
+        "assistant",
+        "",
+        tool_calls=[
+            {
+                "id": "call_late",
+                "type": "function",
+                "function": {"name": "read_file", "arguments": "{}"},
+            }
+        ],
+    )
+    db.append_message(
+        parent_sid,
+        "tool",
+        "late durable result",
+        tool_call_id="call_late",
+        tool_name="read_file",
+    )
 
-    # Frontend takes its snapshot, then another producer commits before this
-    # compressor acquires the lease.
-    stale_snapshot = [{"role": "user", "content": "old durable"}]
-    db.append_message(parent_sid, "assistant", "late committed before lease")
+    # The frontend copied history before the durable tool exchange landed,
+    # then appended this turn's not-yet-persisted user message.
+    stale_snapshot = [
+        {"role": "user", "content": "old durable"},
+        {"role": "user", "content": "newest user"},
+    ]
     agent = _build_agent_with_db(db, parent_sid)
+    agent._persist_user_message_idx = 1
+
+    def _compress_reconciled(messages, **_kwargs):
+        assert [m["role"] for m in messages] == [
+            "user",
+            "assistant",
+            "tool",
+            "user",
+        ]
+        assert sum(
+            1
+            for message in messages
+            if message.get("role") == "user"
+            and message.get("content") == "newest user"
+        ) == 1
+        assert sum(
+            1
+            for message in messages
+            if message.get("tool_call_id") == "call_late"
+        ) == 1
+        return [
+            {"role": "user", "content": "[CONTEXT COMPACTION] summary"},
+            {"role": "user", "content": "newest user"},
+        ]
+
+    agent.context_compressor.compress.side_effect = _compress_reconciled
 
     returned, _system_prompt = agent._compress_context(
         stale_snapshot, "sys", approx_tokens=120_000
     )
 
-    assert returned is stale_snapshot
-    assert agent.session_id == parent_sid
-    assert db.find_live_compression_child(parent_sid) is None
+    assert returned is not stale_snapshot
+    assert [m["content"] for m in returned] == [
+        "[CONTEXT COMPACTION] summary",
+        "newest user",
+    ]
+    assert agent.session_id != parent_sid
+    child_row = db.find_live_compression_child(parent_sid)
+    assert child_row is not None
+    assert child_row["id"] == agent.session_id
     assert [m["content"] for m in db.get_messages_as_conversation(parent_sid)] == [
         "old durable",
-        "late committed before lease",
+        "",
+        "late durable result",
+        "newest user",
     ]
-    agent.context_compressor.compress.assert_not_called()
+    child = db.get_messages_as_conversation(agent.session_id)
+    assert [m["content"] for m in child] == [
+        "[CONTEXT COMPACTION] summary",
+        "newest user",
+    ]
+    assert db.get_compression_lock_holder(parent_sid) is None
+
+
+def test_unreconcilable_prelease_writer_defers_before_provider_call(
+    tmp_path: Path,
+) -> None:
+    """Two independent user tails must defer instead of sending stale context."""
+    db = SessionDB(db_path=tmp_path / "state.db")
+    parent_sid = "PRE_LEASE_USER_CONFLICT"
+    db.create_session(parent_sid, source="webui")
+    old_content = "old durable " + ("x" * 20_000)
+    db.append_message(parent_sid, "user", old_content)
+    db.append_message(parent_sid, "user", "other frontend writer")
+
+    agent = _build_agent_with_db(db, parent_sid)
+    compressor = agent.context_compressor
+    compressor.protect_first_n = 0
+    compressor.protect_last_n = 0
+    compressor.threshold_tokens = 1
+    compressor.context_length = 100
+    compressor.last_prompt_tokens = 0
+    compressor.last_real_prompt_tokens = 0
+    compressor.should_defer_preflight_to_real_usage.return_value = False
+    compressor.get_active_compression_failure_cooldown.return_value = None
+    compressor.snapshot_preflight_display_tokens.return_value = None
+    compressor.should_compress.return_value = True
+    agent.client = MagicMock()
+    agent.client.chat.completions.create.side_effect = AssertionError(
+        "provider must not receive the unreconciled oversized snapshot"
+    )
+
+    result = agent.run_conversation(
+        "newest user",
+        conversation_history=[{"role": "user", "content": old_content}],
+    )
+
+    agent.client.chat.completions.create.assert_not_called()
+    assert result.get("compression_deferred") is True
+    assert result.get("failed") is False
+    durable = db.get_messages_as_conversation(parent_sid)
+    assert sum(
+        1
+        for message in durable
+        if message.get("role") == "user"
+        and message.get("content") == "newest user"
+    ) == 1
+    assert db.get_compression_lock_holder(parent_sid) is None
+
+
+def test_reconcile_overlaps_user_already_persisted_by_frontend(tmp_path: Path) -> None:
+    """Frontend early persistence must not duplicate the newest user turn."""
+    db = SessionDB(db_path=tmp_path / "state.db")
+    parent_sid = "PRE_LEASE_CURRENT_USER_OVERLAP"
+    db.create_session(parent_sid, source="desktop")
+    db.append_message(parent_sid, "user", "old durable")
+    db.append_message(parent_sid, "assistant", "late durable answer")
+    agent = _build_agent_with_db(db, parent_sid)
+
+    # Exercise the real CLI close writer that caused the incident: chat() has
+    # staged the current user dict, the worker still exposes its stale history,
+    # and close persistence commits that staged dict before preflight acquires
+    # the compression lease.
+    from cli import HermesCLI
+
+    stale_history = [{"role": "user", "content": "old durable"}]
+    staged_user = {"role": "user", "content": "newest user"}
+    agent._session_messages = list(stale_history)
+    agent._pending_cli_user_message = staged_user
+    cli = HermesCLI.__new__(HermesCLI)
+    cli.agent = agent
+    cli.conversation_history = [*stale_history, staged_user]
+    cli.session_id = parent_sid
+    cli._persist_active_session_before_close()
+
+    stale_snapshot = [*stale_history, staged_user]
+    agent._persist_user_message_idx = 1
+
+    def _compress_overlap(messages, **_kwargs):
+        assert [m["content"] for m in messages] == [
+            "old durable",
+            "late durable answer",
+            "newest user",
+        ]
+        return [
+            {"role": "user", "content": "[CONTEXT COMPACTION] summary"},
+            {"role": "user", "content": "newest user"},
+        ]
+
+    agent.context_compressor.compress.side_effect = _compress_overlap
+    returned, _system_prompt = agent._compress_context(
+        stale_snapshot, "sys", approx_tokens=120_000
+    )
+
+    assert [m["content"] for m in returned] == [
+        "[CONTEXT COMPACTION] summary",
+        "newest user",
+    ]
+    parent = db.get_messages_as_conversation(parent_sid)
+    assert [m["content"] for m in parent] == [
+        "old durable",
+        "late durable answer",
+        "newest user",
+    ]
+    assert sum(m.get("content") == "newest user" for m in parent) == 1
+    assert db.get_compression_lock_holder(parent_sid) is None
 
 
 def test_skipped_compression_returns_messages_unchanged(tmp_path: Path) -> None:

@@ -34,6 +34,7 @@ from agent.conversation_compression import (
     COMPRESSION_RETRY_TOKENS_STATUS_TEMPLATE,
     COMPRESSION_RETRY_TOO_LARGE_STATUS_TEMPLATE,
     PRE_API_COMPRESSION_STATUS_TEMPLATE,
+    compression_deferred_due_to_drift,
     compression_skipped_due_to_lock,
     conversation_history_after_compression,
 )
@@ -677,37 +678,47 @@ def _compression_deferred_result(
     messages: List[Dict],
     api_call_count: int,
 ) -> Dict[str, Any]:
-    """Build the soft turn result for a lock-contended compression defer.
+    """Build the soft turn result for a temporary compression defer.
 
-    Another path (a sibling turn, a background review fork, a manual
-    ``/compress``) holds this session's compression lock, so every
-    compression pass this turn no-oped and the request still does not fit.
-    This is a TEMPORARY condition — the lock winner is actively shrinking
-    the same session — so the turn must end as a soft defer
+    Either another path holds this session's compression lock, or the durable
+    transcript changed before lease acquisition in an ordering that cannot be
+    reconciled safely. Both are TEMPORARY concurrency conditions, so the turn
+    must end as a soft defer
     (``compression_deferred``), never as ``compression_exhausted``: the
     gateway auto-resets (wipes) the session on exhaustion (#9893/#35809),
-    which would destroy a session that the concurrent compressor is about
-    to make healthy again.
+    which would destroy the durable transcript this branch is protecting.
 
     ``failed`` stays False so the gateway persists the user turn (transient
     branch) and retry-next-message semantics apply.
     """
-    holder = getattr(agent, "_compression_skipped_due_to_lock", None)
-    logger.info(
-        "turn deferred: compression lock held by another path "
-        "(session=%s holder=%s) — not counting as compression exhaustion",
-        agent.session_id or "none",
-        holder if isinstance(holder, str) else "unconfirmed",
-    )
+    if compression_deferred_due_to_drift(agent):
+        logger.info(
+            "turn deferred: durable conversation changed incompatibly before "
+            "compression lease acquisition (session=%s) — no provider call",
+            agent.session_id or "none",
+        )
+        _final = (
+            "The conversation changed concurrently while context compression "
+            "was starting. Please retry in a moment — your message was saved "
+            "and no oversized request was sent."
+        )
+    else:
+        holder = getattr(agent, "_compression_skipped_due_to_lock", None)
+        logger.info(
+            "turn deferred: compression lock held by another path "
+            "(session=%s holder=%s) — not counting as compression exhaustion",
+            agent.session_id or "none",
+            holder if isinstance(holder, str) else "unconfirmed",
+        )
+        _final = (
+            "Context compression is already running for this session. "
+            "Please retry in a moment — your next message will be processed "
+            "once the concurrent compression finishes."
+        )
     try:
         agent._flush_status_buffer()
     except Exception:
         pass
-    _final = (
-        "Context compression is already running for this session. "
-        "Please retry in a moment — your next message will be processed "
-        "once the concurrent compression finishes."
-    )
     return {
         "final_response": _final,
         "messages": messages,
@@ -968,6 +979,12 @@ def run_conversation(
     _should_review_memory = _ctx.should_review_memory
     _plugin_user_context = _ctx.plugin_user_context
     _ext_prefetch_cache = _ctx.ext_prefetch_cache
+
+    # The prologue already persisted the user message after an unsafe durable
+    # drift. End softly before constructing any provider request; the retry
+    # will reload the canonical transcript and acquire a fresh lease.
+    if compression_deferred_due_to_drift(agent):
+        return _compression_deferred_result(agent, messages, 0)
 
     # Commentary deduplication spans all provider continuations and tool calls
     # within one user turn, but must not suppress the same phrase next turn.
@@ -1651,6 +1668,10 @@ def run_conversation(
                 approx_tokens=request_pressure_tokens,
                 task_id=effective_task_id,
             )
+            if messages is _pre_api_input and compression_deferred_due_to_drift(agent):
+                compression_attempts -= 1
+                agent._persist_session(messages, conversation_history)
+                return _compression_deferred_result(agent, messages, api_call_count)
             if messages is _pre_api_input and compression_skipped_due_to_lock(agent):
                 # #69870 lock-skip: another path holds this session's
                 # compression lock, so this pass no-oped. That is a temporary
@@ -4162,13 +4183,15 @@ def run_conversation(
                         messages, system_message, approx_tokens=approx_tokens,
                         task_id=effective_task_id,
                     )
-                    if messages is _overflow_input and compression_skipped_due_to_lock(agent):
-                        # #69870 lock-skip: the provider proved the request
-                        # does not fit, but this compression pass no-oped only
-                        # because another path holds the session's compression
-                        # lock. Temporary defer, not exhaustion — refund the
-                        # attempt and end the turn softly so the gateway does
-                        # NOT auto-reset the session (#9893/#35809).
+                    if messages is _overflow_input and (
+                        compression_skipped_due_to_lock(agent)
+                        or compression_deferred_due_to_drift(agent)
+                    ):
+                        # The provider proved the request does not fit, but this
+                        # compression pass no-oped for a temporary concurrency
+                        # condition: either another path owns the lease (#69870)
+                        # or pre-lease durable drift could not be ordered safely.
+                        # Defer without gateway auto-reset (#9893/#35809).
                         compression_attempts -= 1
                         agent._persist_session(messages, conversation_history)
                         return _compression_deferred_result(
@@ -4416,13 +4439,15 @@ def run_conversation(
                         messages, system_message, approx_tokens=approx_tokens,
                         task_id=effective_task_id,
                     )
-                    if messages is _overflow_input and compression_skipped_due_to_lock(agent):
-                        # #69870 lock-skip: the provider proved the request
-                        # does not fit, but this compression pass no-oped only
-                        # because another path holds the session's compression
-                        # lock. Temporary defer, not exhaustion — refund the
-                        # attempt and end the turn softly so the gateway does
-                        # NOT auto-reset the session (#9893/#35809).
+                    if messages is _overflow_input and (
+                        compression_skipped_due_to_lock(agent)
+                        or compression_deferred_due_to_drift(agent)
+                    ):
+                        # The provider proved the request does not fit, but this
+                        # compression pass no-oped for a temporary concurrency
+                        # condition: either another path owns the lease (#69870)
+                        # or pre-lease durable drift could not be ordered safely.
+                        # Defer without gateway auto-reset (#9893/#35809).
                         compression_attempts -= 1
                         agent._persist_session(messages, conversation_history)
                         return _compression_deferred_result(
@@ -5840,6 +5865,15 @@ def run_conversation(
                         approx_tokens=agent.context_compressor.last_prompt_tokens,
                         task_id=effective_task_id,
                     )
+                    if (
+                        messages is _post_tool_input
+                        and compression_deferred_due_to_drift(agent)
+                    ):
+                        compression_attempts -= 1
+                        agent._persist_session(messages, conversation_history)
+                        return _compression_deferred_result(
+                            agent, messages, api_call_count
+                        )
                     if (
                         messages is _post_tool_input
                         and compression_skipped_due_to_lock(agent)

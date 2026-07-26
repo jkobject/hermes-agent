@@ -141,6 +141,16 @@ def _plain_noop_compress(agent):
     return _compress
 
 
+def _drift_deferring_compress(agent):
+    """A compress double that cannot safely order two concurrent writers."""
+
+    def _compress(messages, _system_message, **_kwargs):
+        agent._compression_deferred_due_to_drift = "SESSION_WITH_DRIFT"
+        return messages, "You are helpful."
+
+    return _compress
+
+
 # ---------------------------------------------------------------------------
 # Type-pinned signal read (MagicMock test-double immunity)
 # ---------------------------------------------------------------------------
@@ -177,6 +187,31 @@ class TestLockSkipSignalTypePin:
 
 
 class TestLockContended413Defer:
+    @pytest.mark.parametrize("provider_error", [_make_413_error(), _make_overflow_error()])
+    def test_prelease_drift_overflow_returns_compression_deferred(
+        self, agent, provider_error
+    ):
+        """Provider-proven overflow must not retry an unreconciled snapshot."""
+        agent.client.chat.completions.create.side_effect = provider_error
+
+        with (
+            patch.object(
+                agent,
+                "_compress_context",
+                side_effect=_drift_deferring_compress(agent),
+            ) as mock_compress,
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation("hello", conversation_history=list(_PREFILL))
+
+        mock_compress.assert_called_once()
+        assert agent.client.chat.completions.create.call_count == 1
+        assert result.get("compression_deferred") is True
+        assert not result.get("compression_exhausted")
+        assert result.get("failed") is False
+
     def test_lock_contended_413_returns_compression_deferred(self, agent):
         """A 413 whose compression pass lost the lock must end the turn as a
         soft ``compression_deferred`` — never ``compression_exhausted``."""

@@ -373,6 +373,93 @@ def compression_skipped_due_to_lock(agent: Any) -> bool:
     return _sig is True or isinstance(_sig, str)
 
 
+def compression_deferred_due_to_drift(agent: Any) -> bool:
+    """Return whether this attempt found an unsafe pre-lease writer conflict."""
+    _sig = getattr(agent, "_compression_deferred_due_to_drift", None)
+    return _sig is True or isinstance(_sig, str)
+
+
+def _durable_overlap_identity(message: Any) -> Any:
+    """Return the stable fields used to overlap a live turn with durable rows."""
+    if not isinstance(message, dict):
+        return None
+    return tuple(
+        message.get(key)
+        for key in (
+            "role",
+            "content",
+            "tool_call_id",
+            "tool_calls",
+            "tool_name",
+            "api_content",
+        )
+    )
+
+
+def _reconcile_durable_parent_with_live_turn(
+    agent: Any,
+    durable_parent: Any,
+    messages: List[Dict[str, Any]],
+) -> Optional[List[Dict[str, Any]]]:
+    """Rebase a stale live snapshot onto the leased durable parent.
+
+    ``_persist_user_message_idx`` is the boundary between the caller's stale
+    history copy and this turn's live suffix. Durable rows are authoritative
+    before that boundary. The durable store may also already contain a prefix
+    of the current turn (early user/tool persistence), so overlap live rows
+    carrying the message-local durable marker instead of appending them twice.
+    Semantic equality alone is insufficient because a user may legitimately
+    submit the same text in two consecutive turns.
+
+    Return ``None`` when the boundary is unavailable or the two writers ended
+    on consecutive user messages; that ordering cannot be reconciled without
+    inventing an assistant response, so callers must defer rather than publish
+    a guessed transcript.
+    """
+    if not isinstance(durable_parent, list):
+        return None
+    current_idx = getattr(agent, "_persist_user_message_idx", None)
+    if (
+        not isinstance(current_idx, int)
+        or isinstance(current_idx, bool)
+        or current_idx < 0
+        or current_idx > len(messages)
+    ):
+        return None
+
+    live_turn = list(messages[current_idx:])
+    max_overlap = min(len(durable_parent), len(live_turn))
+    overlap = 0
+    for size in range(max_overlap, 0, -1):
+        durable_tail = durable_parent[-size:]
+        live_prefix = live_turn[:size]
+        if all(
+            live.get("_db_persisted") is True
+            and _durable_overlap_identity(stored)
+            == _durable_overlap_identity(live)
+            for stored, live in zip(durable_tail, live_prefix)
+        ):
+            overlap = size
+            break
+
+    if (
+        overlap == 0
+        and durable_parent
+        and live_turn
+        and durable_parent[-1].get("role") == "user"
+        and live_turn[0].get("role") == "user"
+    ):
+        return None
+
+    durable_copy = copy.deepcopy(durable_parent)
+    for message in durable_copy:
+        if isinstance(message, dict):
+            message["_db_persisted"] = True
+    reconciled = durable_copy + copy.deepcopy(live_turn[overlap:])
+    agent._persist_user_message_idx = len(durable_copy) - overlap
+    return reconciled
+
+
 def _adopt_live_compression_child(
     agent: Any,
     session_db: Any,
@@ -1289,6 +1376,7 @@ def compress_context(
     # second clear before lock acquisition below stays for the same reason
     # it was added in #69870 and is simply idempotent now.
     agent._compression_skipped_due_to_lock = None
+    agent._compression_deferred_due_to_drift = None
 
     _attempt_started_at = time.monotonic()
     _attempt_id = uuid.uuid4().hex
@@ -1671,14 +1759,15 @@ def compress_context(
             _lock_refresher.start()
 
         # The caller's history snapshot predates lease acquisition. Reload the
-        # durable parent after the lease is live; MORE durable rows than the
-        # snapshot carries means a frontend/background writer committed a turn
-        # in that window, so publishing from this snapshot would omit it.
-        # Deliberately a LENGTH check, not content equality: in-memory
-        # mutation of past turns is legal (multimodal compression, retry
-        # history replacement, think-tag stripping), and a content-equality
-        # abort would permanently wedge compression on such sessions — the
-        # #14694 failure shape.
+        # durable parent after the lease is live; rows beyond the live current-
+        # turn boundary mean a frontend/background writer committed in that
+        # window. Rebase onto that durable prefix and overlap any already-
+        # persisted current-turn suffix (notably CLI close persistence) rather
+        # than either dropping or duplicating it. Deliberately do not compare
+        # the historical prefix by content: in-memory mutation of past turns is
+        # legal (multimodal compression, retry history replacement, think-tag
+        # stripping), and equality gating permanently wedges those sessions —
+        # the #14694 failure shape.
         # Rotation-only: in-place compaction (archive_and_compact) is
         # non-destructive — pre-compaction rows are soft-archived (active=0,
         # compacted=1), stay searchable and recoverable, so snapshot/durable
@@ -1689,17 +1778,39 @@ def compress_context(
             )
             if callable(durable_loader):
                 durable_parent = durable_loader(_lock_db, _lock_sid)
-                if isinstance(durable_parent, list) and len(durable_parent) > len(messages):
-                    logger.warning(
-                        "compression aborted: session=%s changed before lease "
-                        "acquisition; preserving newer durable messages",
-                        _lock_sid,
+                current_idx = getattr(agent, "_persist_user_message_idx", None)
+                durable_rows = durable_parent if isinstance(durable_parent, list) else []
+                durable_advanced = (
+                    isinstance(current_idx, int)
+                    and not isinstance(current_idx, bool)
+                    and len(durable_rows) > current_idx
+                )
+                if durable_advanced:
+                    reconciled = _reconcile_durable_parent_with_live_turn(
+                        agent, durable_rows, messages
                     )
-                    _release_lock()
-                    existing_prompt = getattr(agent, "_cached_system_prompt", None)
-                    if not existing_prompt:
-                        existing_prompt = agent._build_system_prompt(system_message)
-                    return messages, existing_prompt
+                    if reconciled is None:
+                        agent._compression_deferred_due_to_drift = _lock_sid or True
+                        logger.warning(
+                            "compression deferred: session=%s changed before lease "
+                            "acquisition and could not be reconciled safely",
+                            _lock_sid,
+                        )
+                        _release_lock()
+                        existing_prompt = getattr(agent, "_cached_system_prompt", None)
+                        if not existing_prompt:
+                            existing_prompt = agent._build_system_prompt(system_message)
+                        return messages, existing_prompt
+                    logger.warning(
+                        "compression recovery: session=%s advanced before lease "
+                        "acquisition; rebased snapshot messages=%d durable=%d "
+                        "reconciled=%d",
+                        _lock_sid,
+                        len(messages),
+                        len(durable_rows),
+                        len(reconciled),
+                    )
+                    messages = reconciled
 
         # Notify external memory provider before compression discards context.
         # The provider's on_pre_compress() may return a string of insights it
