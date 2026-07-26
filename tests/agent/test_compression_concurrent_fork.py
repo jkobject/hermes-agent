@@ -411,6 +411,58 @@ def test_durable_messages_committed_before_lease_are_reconciled_and_compressed(
     assert db.get_compression_lock_holder(parent_sid) is None
 
 
+def test_reconciled_prelease_drift_summary_abort_defers_before_provider_call(
+    tmp_path: Path,
+) -> None:
+    """A failed summary after durable rebase must not submit oversized context."""
+    db = SessionDB(db_path=tmp_path / "state.db")
+    parent_sid = "PRE_LEASE_REBASE_SUMMARY_ABORT"
+    db.create_session(parent_sid, source="webui")
+    old_content = "old durable " + ("x" * 20_000)
+    db.append_message(parent_sid, "user", old_content)
+    db.append_message(parent_sid, "assistant", "late durable answer")
+
+    agent = _build_agent_with_db(db, parent_sid)
+    compressor = agent.context_compressor
+    compressor.protect_first_n = 0
+    compressor.protect_last_n = 0
+    compressor.threshold_tokens = 1
+    compressor.context_length = 100
+    compressor.last_prompt_tokens = 0
+    compressor.last_real_prompt_tokens = 0
+    compressor.should_defer_preflight_to_real_usage.return_value = False
+    compressor.get_active_compression_failure_cooldown.return_value = None
+    compressor.snapshot_preflight_display_tokens.return_value = None
+    compressor.should_compress.return_value = True
+
+    def _abort_summary(messages, **_kwargs):
+        compressor._last_compress_aborted = True
+        compressor._last_summary_error = "auxiliary summary failed"
+        return messages
+
+    compressor.compress.side_effect = _abort_summary
+    agent.client = MagicMock()
+    agent.client.chat.completions.create.side_effect = AssertionError(
+        "provider must not receive the reconciled oversized snapshot"
+    )
+
+    result = agent.run_conversation(
+        "newest user",
+        conversation_history=[{"role": "user", "content": old_content}],
+    )
+
+    agent.client.chat.completions.create.assert_not_called()
+    assert result.get("compression_deferred") is True
+    assert result.get("failed") is False
+    durable = db.get_messages_as_conversation(parent_sid)
+    assert [message.get("content") for message in durable] == [
+        old_content,
+        "late durable answer",
+        "newest user",
+    ]
+    assert db.get_compression_lock_holder(parent_sid) is None
+
+
 def test_unreconcilable_prelease_writer_defers_before_provider_call(
     tmp_path: Path,
 ) -> None:

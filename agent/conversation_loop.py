@@ -1668,7 +1668,7 @@ def run_conversation(
                 approx_tokens=request_pressure_tokens,
                 task_id=effective_task_id,
             )
-            if messages is _pre_api_input and compression_deferred_due_to_drift(agent):
+            if compression_deferred_due_to_drift(agent):
                 compression_attempts -= 1
                 agent._persist_session(messages, conversation_history)
                 return _compression_deferred_result(agent, messages, api_call_count)
@@ -4183,14 +4183,14 @@ def run_conversation(
                         messages, system_message, approx_tokens=approx_tokens,
                         task_id=effective_task_id,
                     )
-                    if messages is _overflow_input and (
-                        compression_skipped_due_to_lock(agent)
-                        or compression_deferred_due_to_drift(agent)
+                    if compression_deferred_due_to_drift(agent) or (
+                        messages is _overflow_input
+                        and compression_skipped_due_to_lock(agent)
                     ):
                         # The provider proved the request does not fit, but this
                         # compression pass no-oped for a temporary concurrency
                         # condition: either another path owns the lease (#69870)
-                        # or pre-lease durable drift could not be ordered safely.
+                        # or pre-lease durable drift could not finish compression.
                         # Defer without gateway auto-reset (#9893/#35809).
                         compression_attempts -= 1
                         agent._persist_session(messages, conversation_history)
@@ -4439,14 +4439,14 @@ def run_conversation(
                         messages, system_message, approx_tokens=approx_tokens,
                         task_id=effective_task_id,
                     )
-                    if messages is _overflow_input and (
-                        compression_skipped_due_to_lock(agent)
-                        or compression_deferred_due_to_drift(agent)
+                    if compression_deferred_due_to_drift(agent) or (
+                        messages is _overflow_input
+                        and compression_skipped_due_to_lock(agent)
                     ):
                         # The provider proved the request does not fit, but this
                         # compression pass no-oped for a temporary concurrency
                         # condition: either another path owns the lease (#69870)
-                        # or pre-lease durable drift could not be ordered safely.
+                        # or pre-lease durable drift could not finish compression.
                         # Defer without gateway auto-reset (#9893/#35809).
                         compression_attempts -= 1
                         agent._persist_session(messages, conversation_history)
@@ -5865,10 +5865,7 @@ def run_conversation(
                         approx_tokens=agent.context_compressor.last_prompt_tokens,
                         task_id=effective_task_id,
                     )
-                    if (
-                        messages is _post_tool_input
-                        and compression_deferred_due_to_drift(agent)
-                    ):
+                    if compression_deferred_due_to_drift(agent):
                         compression_attempts -= 1
                         agent._persist_session(messages, conversation_history)
                         return _compression_deferred_result(

@@ -374,7 +374,7 @@ def compression_skipped_due_to_lock(agent: Any) -> bool:
 
 
 def compression_deferred_due_to_drift(agent: Any) -> bool:
-    """Return whether this attempt found an unsafe pre-lease writer conflict."""
+    """Return whether pre-lease drift prevented a completed compression."""
     _sig = getattr(agent, "_compression_deferred_due_to_drift", None)
     return _sig is True or isinstance(_sig, str)
 
@@ -1523,6 +1523,7 @@ def compress_context(
     _lock_db = getattr(agent, "_session_db", None)
     _lock_sid = agent.session_id or ""
     _lock_holder: Optional[str] = None
+    _durable_rebased = False
     # Probe whether the lock subsystem is actually available on this
     # SessionDB instance. A process running mismatched module versions can have
     # this call site while its long-lived SessionDB instance predates the lock
@@ -1811,6 +1812,7 @@ def compress_context(
                         len(reconciled),
                     )
                     messages = reconciled
+                    _durable_rebased = True
 
         # Notify external memory provider before compression discards context.
         # The provider's on_pre_compress() may return a string of insights it
@@ -1893,6 +1895,8 @@ def compress_context(
         # the no-op via len(returned) == len(input).
         if getattr(agent.context_compressor, "_last_compress_aborted", False):
             try:
+                if _durable_rebased:
+                    agent._compression_deferred_due_to_drift = _lock_sid or True
                 _err = getattr(agent.context_compressor, "_last_summary_error", None) or "unknown error"
                 if getattr(agent, "_last_compression_summary_warning", None) != _err:
                     agent._last_compression_summary_warning = _err
@@ -1923,6 +1927,8 @@ def compress_context(
         # the live list while returning an unchanged snapshot. Neither case may
         # rotate or rewrite the session.
         if compressed == messages_before_compression:
+            if _durable_rebased:
+                agent._compression_deferred_due_to_drift = _lock_sid or True
             if messages != messages_before_compression:
                 messages[:] = copy.deepcopy(messages_before_compression)
             logger.info(
@@ -1943,6 +1949,8 @@ def compress_context(
             return messages, _existing_sp
 
         if not compressed:
+            if _durable_rebased:
+                agent._compression_deferred_due_to_drift = _lock_sid or True
             logger.error(
                 "context compression returned an empty transcript; refusing to "
                 "rotate session=%s so the parent remains resumable",
@@ -1964,6 +1972,8 @@ def compress_context(
         if commit_fence is not None:
             _commit_fence_entered = commit_fence.begin_commit()
             if not _commit_fence_entered:
+                if _durable_rebased:
+                    agent._compression_deferred_due_to_drift = _lock_sid or True
                 logger.info(
                     "Compression commit cancelled before session mutation "
                     "(session=%s).",
