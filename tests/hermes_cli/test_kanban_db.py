@@ -4289,6 +4289,7 @@ def test_strict_task_worktree_board_canonicalizes_every_new_task(kanban_home, tm
             assignee="dev",
             workspace_kind="dir",
             workspace_path=str(repo),
+            branch_name="shared-producer-branch",
             board="strict-worktrees",
         )
         second = kb.create_task(
@@ -4297,6 +4298,7 @@ def test_strict_task_worktree_board_canonicalizes_every_new_task(kanban_home, tm
             assignee="reviewer",
             workspace_kind="dir",
             workspace_path=str(repo / ".worktrees" / first),
+            branch_name="shared-producer-branch",
             board="strict-worktrees",
         )
         first_task = kb.get_task(conn, first)
@@ -4307,6 +4309,8 @@ def test_strict_task_worktree_board_canonicalizes_every_new_task(kanban_home, tm
     assert first_task.workspace_path == str(repo / ".worktrees" / first)
     assert second_task.workspace_path == str(repo / ".worktrees" / second)
     assert first_task.workspace_path != second_task.workspace_path
+    assert first_task.branch_name == f"wt/{first}"
+    assert second_task.branch_name == f"wt/{second}"
 
 
 def test_strict_task_worktree_path_tracks_fresh_id_after_collision(

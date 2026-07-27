@@ -3101,6 +3101,8 @@ def create_task(
                 # these kill the random ``wt/<task-id>`` worker fallback and the
                 # unanchored ``.worktrees/<id>`` under the dispatcher's cwd.
                 if workspace_kind == "worktree" and project_repo:
+                    if strict_worktree_repo is not None:
+                        branch_name = f"wt/{task_id}"
                     if strict_worktree_repo is not None or not workspace_path:
                         workspace_path = os.path.join(
                             project_repo, ".worktrees", task_id
@@ -6354,15 +6356,22 @@ def _strict_task_worktree_violation(
             "strict_task_worktrees: board.default_workdir is missing or not a git repo"
         )
     expected = (repo_root / ".worktrees" / task.id).resolve(strict=False)
+    expected_branch = f"wt/{task.id}"
     actual = (
         Path(task.workspace_path).expanduser().resolve(strict=False)
         if task.workspace_path
         else None
     )
-    if task.workspace_kind != "worktree" or actual != expected:
+    if (
+        task.workspace_kind != "worktree"
+        or actual != expected
+        or task.branch_name != expected_branch
+    ):
         return (
             "strict_task_worktrees: task must own canonical worktree "
-            f"{expected}; got kind={task.workspace_kind!r} path={task.workspace_path!r}"
+            f"{expected} on branch {expected_branch!r}; got "
+            f"kind={task.workspace_kind!r} path={task.workspace_path!r} "
+            f"branch={task.branch_name!r}"
         )
     return None
 
