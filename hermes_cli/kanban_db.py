@@ -657,31 +657,6 @@ def _default_board_display_name(slug: str) -> str:
     return " ".join(part.capitalize() for part in slug.replace("_", "-").split("-") if part) or slug
 
 
-def _board_slug_for_connection(conn: sqlite3.Connection) -> Optional[str]:
-    """Infer the board slug from the connection's main SQLite file."""
-    try:
-        rows = conn.execute("PRAGMA database_list").fetchall()
-    except sqlite3.Error:
-        return None
-    raw_path = next(
-        (
-            (row["file"] if isinstance(row, sqlite3.Row) else row[2])
-            for row in rows
-            if (row["name"] if isinstance(row, sqlite3.Row) else row[1]) == "main"
-        ),
-        "",
-    )
-    if not raw_path:
-        return None
-    db_path = Path(str(raw_path)).expanduser().resolve(strict=False)
-    if db_path == kanban_db_path(DEFAULT_BOARD).resolve(strict=False):
-        return DEFAULT_BOARD
-    boards_root = (kanban_home() / "kanban" / "boards").resolve(strict=False)
-    if db_path.name == "kanban.db" and db_path.parent.parent == boards_root:
-        return db_path.parent.name
-    return None
-
-
 def read_board_metadata(board: Optional[str] = None) -> dict:
     """Return ``board.json`` contents (or synthesized defaults).
 
@@ -698,7 +673,6 @@ def read_board_metadata(board: Optional[str] = None) -> dict:
         "icon": "",
         "color": "",
         "default_workdir": None,
-        "strict_task_worktrees": False,
         "created_at": None,
         "archived": False,
     }
@@ -726,7 +700,6 @@ def write_board_metadata(
     color: Optional[str] = None,
     archived: Optional[bool] = None,
     default_workdir: Optional[str] = None,
-    strict_task_worktrees: Optional[bool] = None,
 ) -> dict:
     """Create / update ``board.json`` for ``board``.
 
@@ -751,8 +724,6 @@ def write_board_metadata(
         meta["archived"] = bool(archived)
     if default_workdir is not None:
         meta["default_workdir"] = str(default_workdir) if default_workdir else None
-    if strict_task_worktrees is not None:
-        meta["strict_task_worktrees"] = bool(strict_task_worktrees)
     if not meta.get("created_at"):
         meta["created_at"] = int(time.time())
     path = board_metadata_path(slug)
@@ -773,7 +744,6 @@ def create_board(
     icon: Optional[str] = None,
     color: Optional[str] = None,
     default_workdir: Optional[str] = None,
-    strict_task_worktrees: Optional[bool] = None,
 ) -> dict:
     """Create a new board directory + DB + metadata. Idempotent.
 
@@ -791,7 +761,6 @@ def create_board(
         icon=icon,
         color=color,
         default_workdir=default_workdir,
-        strict_task_worktrees=strict_task_worktrees,
     )
     # Touch the DB so list_boards() sees it immediately.
     init_db(board=normed)
@@ -2870,36 +2839,6 @@ def create_task(
     assignee = _canonical_assignee(assignee)
     if not title or not title.strip():
         raise ValueError("title is required")
-    conn_board = _board_slug_for_connection(conn)
-    if board is not None:
-        board_slug = _normalize_board_slug(board) or DEFAULT_BOARD
-        if conn_board is not None and board_slug != conn_board:
-            raise ValueError(
-                f"board {board_slug!r} does not match connection board {conn_board!r}"
-            )
-    else:
-        board_slug = conn_board or get_current_board()
-    board_meta = read_board_metadata(board_slug)
-    strict_worktree_repo: Optional[str] = None
-    if board_meta.get("strict_task_worktrees"):
-        raw_repo = str(board_meta.get("default_workdir") or "").strip()
-        if not raw_repo:
-            raise ValueError("strict_task_worktrees requires board.default_workdir")
-        strict_repo = Path(raw_repo).expanduser()
-        if not strict_repo.is_absolute():
-            raise ValueError(
-                "strict_task_worktrees requires an absolute board.default_workdir"
-            )
-        strict_repo_root = _git_toplevel(strict_repo)
-        if strict_repo_root is None:
-            raise ValueError(
-                "strict_task_worktrees requires board.default_workdir inside a git repo"
-            )
-        strict_worktree_repo = str(strict_repo_root)
-        # Board policy overrides shared dirs, producer worktrees, and scratch.
-        # The concrete task-id-keyed path is derived after id allocation.
-        workspace_kind = "worktree"
-        workspace_path = None
     if initial_status not in VALID_INITIAL_STATUSES:
         raise ValueError(
             f"initial_status must be one of {sorted(VALID_INITIAL_STATUSES)}"
@@ -3002,11 +2941,6 @@ def create_task(
                 # Defer the concrete path to the insert loop: it's a fresh
                 # ``<repo>/.worktrees/<task-id>`` dir keyed on the new task id.
                 project_repo = str(project_obj.primary_path)
-
-    if strict_worktree_repo is not None:
-        workspace_kind = "worktree"
-        workspace_path = None
-        project_repo = strict_worktree_repo
 
     parents = tuple(p for p in parents if p)
 
@@ -3133,14 +3067,12 @@ def create_task(
                 # plus a deterministic branch (project slug + task id). Together
                 # these kill the random ``wt/<task-id>`` worker fallback and the
                 # unanchored ``.worktrees/<id>`` under the dispatcher's cwd.
-                if workspace_kind == "worktree" and project_repo:
-                    if strict_worktree_repo is not None:
-                        branch_name = f"wt/{task_id}"
-                    if strict_worktree_repo is not None or not workspace_path:
+                if project_obj is not None and workspace_kind == "worktree":
+                    if project_repo and not workspace_path:
                         workspace_path = os.path.join(
                             project_repo, ".worktrees", task_id
                         )
-                    if project_obj is not None and not branch_name:
+                    if not branch_name:
                         # _pdb was imported above when project_obj was resolved.
                         try:
                             branch_name = _pdb.branch_name_for(
@@ -4070,13 +4002,6 @@ def claim_task(
     lock = claimer or _claimer_id()
     expires = now + _resolve_claim_ttl_seconds(ttl_seconds)
     with write_txn(conn):
-        candidate = get_task(conn, task_id)
-        if candidate is not None and candidate.status == "ready":
-            violation = _strict_task_worktree_violation(
-                candidate, board=_board_slug_for_connection(conn)
-            )
-            if violation is not None:
-                raise ValueError(violation)
         if is_block_loop_frozen(conn, task_id):
             return None
         # Structural invariant: never transition ready -> running while any
@@ -4208,13 +4133,6 @@ def claim_review_task(
     lock = claimer or _claimer_id()
     expires = now + _resolve_claim_ttl_seconds(ttl_seconds)
     with write_txn(conn):
-        candidate = get_task(conn, task_id)
-        if candidate is not None and candidate.status == "review":
-            violation = _strict_task_worktree_violation(
-                candidate, board=_board_slug_for_connection(conn)
-            )
-            if violation is not None:
-                raise ValueError(violation)
         if is_block_loop_frozen(conn, task_id):
             return None
         cur = conn.execute(
@@ -6388,41 +6306,6 @@ def _ensure_git_worktree(repo_root: Path, target: Path, branch_name: str) -> Non
         )
 
 
-def _strict_task_worktree_violation(
-    task: Task, *, board: Optional[str] = None
-) -> Optional[str]:
-    """Return a fail-closed diagnostic when a strict-board task was tampered."""
-    board_slug = board if board else get_current_board()
-    meta = read_board_metadata(board_slug)
-    if not meta.get("strict_task_worktrees"):
-        return None
-    raw_repo = str(meta.get("default_workdir") or "").strip()
-    repo_root = _git_toplevel(Path(raw_repo).expanduser()) if raw_repo else None
-    if repo_root is None:
-        return (
-            "strict_task_worktrees: board.default_workdir is missing or not a git repo"
-        )
-    expected = (repo_root / ".worktrees" / task.id).resolve(strict=False)
-    expected_branch = f"wt/{task.id}"
-    actual = (
-        Path(task.workspace_path).expanduser().resolve(strict=False)
-        if task.workspace_path
-        else None
-    )
-    if (
-        task.workspace_kind != "worktree"
-        or actual != expected
-        or task.branch_name != expected_branch
-    ):
-        return (
-            "strict_task_worktrees: task must own canonical worktree "
-            f"{expected} on branch {expected_branch!r}; got "
-            f"kind={task.workspace_kind!r} path={task.workspace_path!r} "
-            f"branch={task.branch_name!r}"
-        )
-    return None
-
-
 def _resolve_worktree_workspace(
     task: Task, *, board: Optional[str] = None
 ) -> tuple[Path, str]:
@@ -8221,16 +8104,6 @@ def dispatch_once(
     boards tick in parallel. See :func:`_dispatch_tick_lock` for the
     cross-process / cross-platform mechanics.
     """
-    conn_board = _board_slug_for_connection(conn)
-    if board is None:
-        board = conn_board or get_current_board()
-    else:
-        normalized_board = _normalize_board_slug(board) or DEFAULT_BOARD
-        if conn_board is not None and normalized_board != conn_board:
-            raise ValueError(
-                f"board {normalized_board!r} does not match connection board {conn_board!r}"
-            )
-        board = normalized_board
     try:
         db_path = kanban_db_path(board=board)
     except Exception:
@@ -8518,22 +8391,6 @@ def _dispatch_once_locked(
                         {"reason": guard_reason},
                     )
             continue
-        candidate = get_task(conn, row["id"])
-        strict_violation = (
-            _strict_task_worktree_violation(candidate, board=board)
-            if candidate is not None
-            else None
-        )
-        if strict_violation is not None:
-            if dry_run:
-                result.auto_blocked.append(row["id"])
-            else:
-                auto = _record_spawn_failure(
-                    conn, row["id"], strict_violation, failure_limit=1
-                )
-                if auto:
-                    result.auto_blocked.append(row["id"])
-            continue
         if dry_run:
             result.spawned.append((row["id"], row_assignee, ""))
             # Increment per-profile counter even in dry_run so the cap
@@ -8643,22 +8500,6 @@ def _dispatch_once_locked(
             profile_exists = None  # type: ignore[assignment]
         if profile_exists is not None and not profile_exists(row["assignee"]):
             result.skipped_nonspawnable.append(row["id"])
-            continue
-        candidate = get_task(conn, row["id"])
-        strict_violation = (
-            _strict_task_worktree_violation(candidate, board=board)
-            if candidate is not None
-            else None
-        )
-        if strict_violation is not None:
-            if dry_run:
-                result.auto_blocked.append(row["id"])
-            else:
-                auto = _record_spawn_failure(
-                    conn, row["id"], strict_violation, failure_limit=1
-                )
-                if auto:
-                    result.auto_blocked.append(row["id"])
             continue
         if dry_run:
             result.spawned.append((row["id"], row["assignee"], ""))
