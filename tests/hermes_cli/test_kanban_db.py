@@ -4272,6 +4272,39 @@ def test_create_task_dir_without_workspace_inherits_board_default_workdir(kanban
     assert t.workspace_path == default_wd
 
 
+def test_strict_task_worktree_policy_follows_connection_board(
+    kanban_home, tmp_path
+):
+    """Cross-board callers must use the connection's board, not global current."""
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+    kb.create_board("plain")
+    kb.create_board(
+        "strict-cross-board",
+        default_workdir=str(repo),
+        strict_task_worktrees=True,
+    )
+    kb.set_current_board("plain")
+
+    with kb.connect(board="strict-cross-board") as strict_conn:
+        strict_id = kb.create_task(
+            strict_conn, title="strict via connection", assignee="dev"
+        )
+        strict_task = kb.get_task(strict_conn, strict_id)
+
+    kb.set_current_board("strict-cross-board")
+    with kb.connect(board="plain") as plain_conn:
+        plain_id = kb.create_task(
+            plain_conn, title="plain via connection", assignee="dev"
+        )
+        plain_task = kb.get_task(plain_conn, plain_id)
+
+    assert strict_task.workspace_kind == "worktree"
+    assert strict_task.workspace_path == str(repo / ".worktrees" / strict_id)
+    assert plain_task.workspace_kind == "scratch"
+    assert plain_task.workspace_path is None
+
+
 def test_strict_task_worktree_board_canonicalizes_every_new_task(kanban_home, tmp_path):
     """A strict board must not let callers reuse its canonical checkout."""
     repo = tmp_path / "repo"
@@ -4340,6 +4373,62 @@ def test_strict_task_worktree_path_tracks_fresh_id_after_collision(
 
     assert task_id == "t_fresh"
     assert task.workspace_path == str(repo / ".worktrees" / "t_fresh")
+
+
+def test_strict_task_worktree_direct_claim_refuses_tampered_task(
+    kanban_home, tmp_path, all_assignees_spawnable
+):
+    """Public claim APIs cannot bypass strict workspace validation."""
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+    kb.create_board(
+        "strict-direct-claim",
+        default_workdir=str(repo),
+        strict_task_worktrees=True,
+    )
+    with kb.connect(board="strict-direct-claim") as conn:
+        task_id = kb.create_task(
+            conn, title="tampered", assignee="dev", board="strict-direct-claim"
+        )
+        conn.execute(
+            "UPDATE tasks SET workspace_kind='dir', workspace_path=? WHERE id=?",
+            (str(repo), task_id),
+        )
+        conn.commit()
+        with pytest.raises(ValueError, match="strict_task_worktrees"):
+            kb.claim_task(conn, task_id)
+        task = kb.get_task(conn, task_id)
+
+    assert task.status == "ready"
+    assert task.started_at is None
+
+
+def test_strict_task_worktree_direct_review_claim_refuses_tampered_task(
+    kanban_home, tmp_path, all_assignees_spawnable
+):
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+    kb.create_board(
+        "strict-direct-review",
+        default_workdir=str(repo),
+        strict_task_worktrees=True,
+    )
+    with kb.connect(board="strict-direct-review") as conn:
+        task_id = kb.create_task(
+            conn, title="tampered review", assignee="reviewer",
+            board="strict-direct-review"
+        )
+        conn.execute(
+            "UPDATE tasks SET status='review', branch_name='shared' WHERE id=?",
+            (task_id,),
+        )
+        conn.commit()
+        with pytest.raises(ValueError, match="strict_task_worktrees"):
+            kb.claim_review_task(conn, task_id)
+        task = kb.get_task(conn, task_id)
+
+    assert task.status == "review"
+    assert task.started_at is None
 
 
 def test_strict_task_worktree_board_refuses_tampered_shared_checkout_at_dispatch(

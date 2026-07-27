@@ -657,6 +657,31 @@ def _default_board_display_name(slug: str) -> str:
     return " ".join(part.capitalize() for part in slug.replace("_", "-").split("-") if part) or slug
 
 
+def _board_slug_for_connection(conn: sqlite3.Connection) -> Optional[str]:
+    """Infer the board slug from the connection's main SQLite file."""
+    try:
+        rows = conn.execute("PRAGMA database_list").fetchall()
+    except sqlite3.Error:
+        return None
+    raw_path = next(
+        (
+            (row["file"] if isinstance(row, sqlite3.Row) else row[2])
+            for row in rows
+            if (row["name"] if isinstance(row, sqlite3.Row) else row[1]) == "main"
+        ),
+        "",
+    )
+    if not raw_path:
+        return None
+    db_path = Path(str(raw_path)).expanduser().resolve(strict=False)
+    if db_path == kanban_db_path(DEFAULT_BOARD).resolve(strict=False):
+        return DEFAULT_BOARD
+    boards_root = (kanban_home() / "kanban" / "boards").resolve(strict=False)
+    if db_path.name == "kanban.db" and db_path.parent.parent == boards_root:
+        return db_path.parent.name
+    return None
+
+
 def read_board_metadata(board: Optional[str] = None) -> dict:
     """Return ``board.json`` contents (or synthesized defaults).
 
@@ -2845,7 +2870,15 @@ def create_task(
     assignee = _canonical_assignee(assignee)
     if not title or not title.strip():
         raise ValueError("title is required")
-    board_slug = board if board else get_current_board()
+    conn_board = _board_slug_for_connection(conn)
+    if board is not None:
+        board_slug = _normalize_board_slug(board) or DEFAULT_BOARD
+        if conn_board is not None and board_slug != conn_board:
+            raise ValueError(
+                f"board {board_slug!r} does not match connection board {conn_board!r}"
+            )
+    else:
+        board_slug = conn_board or get_current_board()
     board_meta = read_board_metadata(board_slug)
     strict_worktree_repo: Optional[str] = None
     if board_meta.get("strict_task_worktrees"):
@@ -4033,6 +4066,13 @@ def claim_task(
     Returns the claimed ``Task`` on success, ``None`` if the task was
     already claimed (or is not in ``ready`` status).
     """
+    candidate = get_task(conn, task_id)
+    if candidate is not None:
+        violation = _strict_task_worktree_violation(
+            candidate, board=_board_slug_for_connection(conn)
+        )
+        if violation is not None:
+            raise ValueError(violation)
     now = int(time.time())
     lock = claimer or _claimer_id()
     expires = now + _resolve_claim_ttl_seconds(ttl_seconds)
@@ -4164,6 +4204,13 @@ def claim_review_task(
     Creates a new run entry so the review agent's lifecycle is tracked
     independently from the original worker run.
     """
+    candidate = get_task(conn, task_id)
+    if candidate is not None:
+        violation = _strict_task_worktree_violation(
+            candidate, board=_board_slug_for_connection(conn)
+        )
+        if violation is not None:
+            raise ValueError(violation)
     now = int(time.time())
     lock = claimer or _claimer_id()
     expires = now + _resolve_claim_ttl_seconds(ttl_seconds)
@@ -8461,6 +8508,22 @@ def _dispatch_once_locked(
                         {"reason": guard_reason},
                     )
             continue
+        candidate = get_task(conn, row["id"])
+        strict_violation = (
+            _strict_task_worktree_violation(candidate, board=board)
+            if candidate is not None
+            else None
+        )
+        if strict_violation is not None:
+            if dry_run:
+                result.auto_blocked.append(row["id"])
+            else:
+                auto = _record_spawn_failure(
+                    conn, row["id"], strict_violation, failure_limit=1
+                )
+                if auto:
+                    result.auto_blocked.append(row["id"])
+            continue
         if dry_run:
             result.spawned.append((row["id"], row_assignee, ""))
             # Increment per-profile counter even in dry_run so the cap
@@ -8474,14 +8537,6 @@ def _dispatch_once_locked(
             continue
         claimed = claim_task(conn, row["id"], ttl_seconds=ttl_seconds)
         if claimed is None:
-            continue
-        strict_violation = _strict_task_worktree_violation(claimed, board=board)
-        if strict_violation is not None:
-            auto = _record_spawn_failure(
-                conn, claimed.id, strict_violation, failure_limit=1
-            )
-            if auto:
-                result.auto_blocked.append(claimed.id)
             continue
         try:
             resolved_branch_name = None
@@ -8579,19 +8634,27 @@ def _dispatch_once_locked(
         if profile_exists is not None and not profile_exists(row["assignee"]):
             result.skipped_nonspawnable.append(row["id"])
             continue
+        candidate = get_task(conn, row["id"])
+        strict_violation = (
+            _strict_task_worktree_violation(candidate, board=board)
+            if candidate is not None
+            else None
+        )
+        if strict_violation is not None:
+            if dry_run:
+                result.auto_blocked.append(row["id"])
+            else:
+                auto = _record_spawn_failure(
+                    conn, row["id"], strict_violation, failure_limit=1
+                )
+                if auto:
+                    result.auto_blocked.append(row["id"])
+            continue
         if dry_run:
             result.spawned.append((row["id"], row["assignee"], ""))
             continue
         claimed = claim_review_task(conn, row["id"], ttl_seconds=ttl_seconds)
         if claimed is None:
-            continue
-        strict_violation = _strict_task_worktree_violation(claimed, board=board)
-        if strict_violation is not None:
-            auto = _record_spawn_failure(
-                conn, claimed.id, strict_violation, failure_limit=1
-            )
-            if auto:
-                result.auto_blocked.append(claimed.id)
             continue
         try:
             resolved_branch_name = None
