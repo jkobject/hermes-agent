@@ -4375,6 +4375,31 @@ def test_strict_task_worktree_path_tracks_fresh_id_after_collision(
     assert task.workspace_path == str(repo / ".worktrees" / "t_fresh")
 
 
+def test_strict_task_worktree_direct_claim_ignores_nonclaimable_legacy_task(
+    kanban_home, tmp_path, all_assignees_spawnable
+):
+    """Strict validation must not change claim APIs for nonclaimable states."""
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+    kb.create_board(
+        "strict-nonclaimable",
+        default_workdir=str(repo),
+        strict_task_worktrees=True,
+    )
+    with kb.connect(board="strict-nonclaimable") as conn:
+        task_id = kb.create_task(
+            conn, title="legacy done", assignee="dev", board="strict-nonclaimable"
+        )
+        conn.execute(
+            "UPDATE tasks SET status='done', workspace_kind='dir', "
+            "workspace_path=?, branch_name=NULL WHERE id=?",
+            (str(repo), task_id),
+        )
+        conn.commit()
+        assert kb.claim_task(conn, task_id) is None
+        assert kb.claim_review_task(conn, task_id) is None
+
+
 def test_strict_task_worktree_direct_claim_refuses_tampered_task(
     kanban_home, tmp_path, all_assignees_spawnable
 ):

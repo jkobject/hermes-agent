@@ -4067,7 +4067,7 @@ def claim_task(
     already claimed (or is not in ``ready`` status).
     """
     candidate = get_task(conn, task_id)
-    if candidate is not None:
+    if candidate is not None and candidate.status == "ready":
         violation = _strict_task_worktree_violation(
             candidate, board=_board_slug_for_connection(conn)
         )
@@ -4205,7 +4205,7 @@ def claim_review_task(
     independently from the original worker run.
     """
     candidate = get_task(conn, task_id)
-    if candidate is not None:
+    if candidate is not None and candidate.status == "review":
         violation = _strict_task_worktree_violation(
             candidate, board=_board_slug_for_connection(conn)
         )
