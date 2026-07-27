@@ -4066,17 +4066,17 @@ def claim_task(
     Returns the claimed ``Task`` on success, ``None`` if the task was
     already claimed (or is not in ``ready`` status).
     """
-    candidate = get_task(conn, task_id)
-    if candidate is not None and candidate.status == "ready":
-        violation = _strict_task_worktree_violation(
-            candidate, board=_board_slug_for_connection(conn)
-        )
-        if violation is not None:
-            raise ValueError(violation)
     now = int(time.time())
     lock = claimer or _claimer_id()
     expires = now + _resolve_claim_ttl_seconds(ttl_seconds)
     with write_txn(conn):
+        candidate = get_task(conn, task_id)
+        if candidate is not None and candidate.status == "ready":
+            violation = _strict_task_worktree_violation(
+                candidate, board=_board_slug_for_connection(conn)
+            )
+            if violation is not None:
+                raise ValueError(violation)
         if is_block_loop_frozen(conn, task_id):
             return None
         # Structural invariant: never transition ready -> running while any
@@ -4204,17 +4204,17 @@ def claim_review_task(
     Creates a new run entry so the review agent's lifecycle is tracked
     independently from the original worker run.
     """
-    candidate = get_task(conn, task_id)
-    if candidate is not None and candidate.status == "review":
-        violation = _strict_task_worktree_violation(
-            candidate, board=_board_slug_for_connection(conn)
-        )
-        if violation is not None:
-            raise ValueError(violation)
     now = int(time.time())
     lock = claimer or _claimer_id()
     expires = now + _resolve_claim_ttl_seconds(ttl_seconds)
     with write_txn(conn):
+        candidate = get_task(conn, task_id)
+        if candidate is not None and candidate.status == "review":
+            violation = _strict_task_worktree_violation(
+                candidate, board=_board_slug_for_connection(conn)
+            )
+            if violation is not None:
+                raise ValueError(violation)
         if is_block_loop_frozen(conn, task_id):
             return None
         cur = conn.execute(
@@ -8221,6 +8221,16 @@ def dispatch_once(
     boards tick in parallel. See :func:`_dispatch_tick_lock` for the
     cross-process / cross-platform mechanics.
     """
+    conn_board = _board_slug_for_connection(conn)
+    if board is None:
+        board = conn_board or get_current_board()
+    else:
+        normalized_board = _normalize_board_slug(board) or DEFAULT_BOARD
+        if conn_board is not None and normalized_board != conn_board:
+            raise ValueError(
+                f"board {normalized_board!r} does not match connection board {conn_board!r}"
+            )
+        board = normalized_board
     try:
         db_path = kanban_db_path(board=board)
     except Exception:

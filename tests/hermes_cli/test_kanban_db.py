@@ -4375,6 +4375,33 @@ def test_strict_task_worktree_path_tracks_fresh_id_after_collision(
     assert task.workspace_path == str(repo / ".worktrees" / "t_fresh")
 
 
+def test_strict_task_worktree_dispatch_follows_connection_board(
+    kanban_home, tmp_path, all_assignees_spawnable
+):
+    """Omitting board= during cross-board dispatch cannot bypass strict policy."""
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+    kb.create_board("plain-dispatch")
+    kb.create_board(
+        "strict-cross-dispatch",
+        default_workdir=str(repo),
+        strict_task_worktrees=True,
+    )
+    kb.set_current_board("plain-dispatch")
+    with kb.connect(board="strict-cross-dispatch") as conn:
+        task_id = kb.create_task(conn, title="tampered", assignee="dev")
+        conn.execute(
+            "UPDATE tasks SET workspace_kind='dir', workspace_path=?, "
+            "branch_name='shared' WHERE id=?",
+            (str(repo), task_id),
+        )
+        conn.commit()
+        result = kb.dispatch_once(conn, dry_run=True)
+
+    assert task_id not in [tid for tid, _, _ in result.spawned]
+    assert result.auto_blocked == [task_id]
+
+
 def test_strict_task_worktree_direct_claim_ignores_nonclaimable_legacy_task(
     kanban_home, tmp_path, all_assignees_spawnable
 ):
@@ -4398,6 +4425,47 @@ def test_strict_task_worktree_direct_claim_ignores_nonclaimable_legacy_task(
         conn.commit()
         assert kb.claim_task(conn, task_id) is None
         assert kb.claim_review_task(conn, task_id) is None
+
+
+def test_strict_task_worktree_claim_validation_is_atomic(
+    kanban_home, tmp_path, all_assignees_spawnable, monkeypatch
+):
+    """A mutation between read and claim is detected and rolled back."""
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+    kb.create_board(
+        "strict-atomic-claim",
+        default_workdir=str(repo),
+        strict_task_worktrees=True,
+    )
+    with kb.connect(board="strict-atomic-claim") as conn:
+        task_id = kb.create_task(
+            conn, title="race", assignee="dev", board="strict-atomic-claim"
+        )
+        original = kb._strict_task_worktree_violation
+        fired = False
+
+        def mutate_then_validate(task, *, board=None):
+            nonlocal fired
+            if not fired:
+                fired = True
+                conn.execute(
+                    "UPDATE tasks SET workspace_kind='dir', workspace_path=?, "
+                    "branch_name='shared' WHERE id=?",
+                    (str(repo), task_id),
+                )
+                task = kb.get_task(conn, task_id)
+            return original(task, board=board)
+
+        monkeypatch.setattr(kb, "_strict_task_worktree_violation", mutate_then_validate)
+        with pytest.raises(ValueError, match="strict_task_worktrees"):
+            kb.claim_task(conn, task_id)
+        task = kb.get_task(conn, task_id)
+
+    assert task.status == "ready"
+    assert task.workspace_kind == "worktree"
+    assert task.workspace_path == str(repo / ".worktrees" / task_id)
+    assert task.branch_name == f"wt/{task_id}"
 
 
 def test_strict_task_worktree_direct_claim_refuses_tampered_task(
