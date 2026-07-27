@@ -673,6 +673,7 @@ def read_board_metadata(board: Optional[str] = None) -> dict:
         "icon": "",
         "color": "",
         "default_workdir": None,
+        "strict_task_worktrees": False,
         "created_at": None,
         "archived": False,
     }
@@ -700,6 +701,7 @@ def write_board_metadata(
     color: Optional[str] = None,
     archived: Optional[bool] = None,
     default_workdir: Optional[str] = None,
+    strict_task_worktrees: Optional[bool] = None,
 ) -> dict:
     """Create / update ``board.json`` for ``board``.
 
@@ -724,6 +726,8 @@ def write_board_metadata(
         meta["archived"] = bool(archived)
     if default_workdir is not None:
         meta["default_workdir"] = str(default_workdir) if default_workdir else None
+    if strict_task_worktrees is not None:
+        meta["strict_task_worktrees"] = bool(strict_task_worktrees)
     if not meta.get("created_at"):
         meta["created_at"] = int(time.time())
     path = board_metadata_path(slug)
@@ -744,6 +748,7 @@ def create_board(
     icon: Optional[str] = None,
     color: Optional[str] = None,
     default_workdir: Optional[str] = None,
+    strict_task_worktrees: Optional[bool] = None,
 ) -> dict:
     """Create a new board directory + DB + metadata. Idempotent.
 
@@ -761,6 +766,7 @@ def create_board(
         icon=icon,
         color=color,
         default_workdir=default_workdir,
+        strict_task_worktrees=strict_task_worktrees,
     )
     # Touch the DB so list_boards() sees it immediately.
     init_db(board=normed)
@@ -2839,6 +2845,28 @@ def create_task(
     assignee = _canonical_assignee(assignee)
     if not title or not title.strip():
         raise ValueError("title is required")
+    board_slug = board if board else get_current_board()
+    board_meta = read_board_metadata(board_slug)
+    strict_worktree_repo: Optional[str] = None
+    if board_meta.get("strict_task_worktrees"):
+        raw_repo = str(board_meta.get("default_workdir") or "").strip()
+        if not raw_repo:
+            raise ValueError("strict_task_worktrees requires board.default_workdir")
+        strict_repo = Path(raw_repo).expanduser()
+        if not strict_repo.is_absolute():
+            raise ValueError(
+                "strict_task_worktrees requires an absolute board.default_workdir"
+            )
+        strict_repo_root = _git_toplevel(strict_repo)
+        if strict_repo_root is None:
+            raise ValueError(
+                "strict_task_worktrees requires board.default_workdir inside a git repo"
+            )
+        strict_worktree_repo = str(strict_repo_root)
+        # Board policy overrides shared dirs, producer worktrees, and scratch.
+        # The concrete task-id-keyed path is derived after id allocation.
+        workspace_kind = "worktree"
+        workspace_path = None
     if initial_status not in VALID_INITIAL_STATUSES:
         raise ValueError(
             f"initial_status must be one of {sorted(VALID_INITIAL_STATUSES)}"
@@ -2941,6 +2969,11 @@ def create_task(
                 # Defer the concrete path to the insert loop: it's a fresh
                 # ``<repo>/.worktrees/<task-id>`` dir keyed on the new task id.
                 project_repo = str(project_obj.primary_path)
+
+    if strict_worktree_repo is not None:
+        workspace_kind = "worktree"
+        workspace_path = None
+        project_repo = strict_worktree_repo
 
     parents = tuple(p for p in parents if p)
 
@@ -3067,12 +3100,12 @@ def create_task(
                 # plus a deterministic branch (project slug + task id). Together
                 # these kill the random ``wt/<task-id>`` worker fallback and the
                 # unanchored ``.worktrees/<id>`` under the dispatcher's cwd.
-                if project_obj is not None and workspace_kind == "worktree":
-                    if project_repo and not workspace_path:
+                if workspace_kind == "worktree" and project_repo:
+                    if strict_worktree_repo is not None or not workspace_path:
                         workspace_path = os.path.join(
                             project_repo, ".worktrees", task_id
                         )
-                    if not branch_name:
+                    if project_obj is not None and not branch_name:
                         # _pdb was imported above when project_obj was resolved.
                         try:
                             branch_name = _pdb.branch_name_for(
@@ -6306,6 +6339,34 @@ def _ensure_git_worktree(repo_root: Path, target: Path, branch_name: str) -> Non
         )
 
 
+def _strict_task_worktree_violation(
+    task: Task, *, board: Optional[str] = None
+) -> Optional[str]:
+    """Return a fail-closed diagnostic when a strict-board task was tampered."""
+    board_slug = board if board else get_current_board()
+    meta = read_board_metadata(board_slug)
+    if not meta.get("strict_task_worktrees"):
+        return None
+    raw_repo = str(meta.get("default_workdir") or "").strip()
+    repo_root = _git_toplevel(Path(raw_repo).expanduser()) if raw_repo else None
+    if repo_root is None:
+        return (
+            "strict_task_worktrees: board.default_workdir is missing or not a git repo"
+        )
+    expected = (repo_root / ".worktrees" / task.id).resolve(strict=False)
+    actual = (
+        Path(task.workspace_path).expanduser().resolve(strict=False)
+        if task.workspace_path
+        else None
+    )
+    if task.workspace_kind != "worktree" or actual != expected:
+        return (
+            "strict_task_worktrees: task must own canonical worktree "
+            f"{expected}; got kind={task.workspace_kind!r} path={task.workspace_path!r}"
+        )
+    return None
+
+
 def _resolve_worktree_workspace(
     task: Task, *, board: Optional[str] = None
 ) -> tuple[Path, str]:
@@ -8405,6 +8466,14 @@ def _dispatch_once_locked(
         claimed = claim_task(conn, row["id"], ttl_seconds=ttl_seconds)
         if claimed is None:
             continue
+        strict_violation = _strict_task_worktree_violation(claimed, board=board)
+        if strict_violation is not None:
+            auto = _record_spawn_failure(
+                conn, claimed.id, strict_violation, failure_limit=1
+            )
+            if auto:
+                result.auto_blocked.append(claimed.id)
+            continue
         try:
             resolved_branch_name = None
             if claimed.workspace_kind == "worktree":
@@ -8506,6 +8575,14 @@ def _dispatch_once_locked(
             continue
         claimed = claim_review_task(conn, row["id"], ttl_seconds=ttl_seconds)
         if claimed is None:
+            continue
+        strict_violation = _strict_task_worktree_violation(claimed, board=board)
+        if strict_violation is not None:
+            auto = _record_spawn_failure(
+                conn, claimed.id, strict_violation, failure_limit=1
+            )
+            if auto:
+                result.auto_blocked.append(claimed.id)
             continue
         try:
             resolved_branch_name = None

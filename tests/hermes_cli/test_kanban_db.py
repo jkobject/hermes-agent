@@ -4272,6 +4272,110 @@ def test_create_task_dir_without_workspace_inherits_board_default_workdir(kanban
     assert t.workspace_path == default_wd
 
 
+def test_strict_task_worktree_board_canonicalizes_every_new_task(kanban_home, tmp_path):
+    """A strict board must not let callers reuse its canonical checkout."""
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+    kb.create_board(
+        "strict-worktrees",
+        default_workdir=str(repo),
+        strict_task_worktrees=True,
+    )
+
+    with kb.connect(board="strict-worktrees") as conn:
+        first = kb.create_task(
+            conn,
+            title="producer",
+            assignee="dev",
+            workspace_kind="dir",
+            workspace_path=str(repo),
+            board="strict-worktrees",
+        )
+        second = kb.create_task(
+            conn,
+            title="reviewer",
+            assignee="reviewer",
+            workspace_kind="dir",
+            workspace_path=str(repo / ".worktrees" / first),
+            board="strict-worktrees",
+        )
+        first_task = kb.get_task(conn, first)
+        second_task = kb.get_task(conn, second)
+
+    assert first_task.workspace_kind == "worktree"
+    assert second_task.workspace_kind == "worktree"
+    assert first_task.workspace_path == str(repo / ".worktrees" / first)
+    assert second_task.workspace_path == str(repo / ".worktrees" / second)
+    assert first_task.workspace_path != second_task.workspace_path
+
+
+def test_strict_task_worktree_path_tracks_fresh_id_after_collision(
+    kanban_home, tmp_path, monkeypatch
+):
+    """An id retry must not retain the first colliding task's worktree path."""
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+    kb.create_board(
+        "strict-collision",
+        default_workdir=str(repo),
+        strict_task_worktrees=True,
+    )
+    ids = iter(["t_collision", "t_fresh"])
+    monkeypatch.setattr(kb, "_new_task_id", lambda: next(ids))
+
+    with kb.connect(board="strict-collision") as conn:
+        conn.execute(
+            "INSERT INTO tasks (id,title,status,created_at,workspace_kind) "
+            "VALUES ('t_collision','existing','done',1,'scratch')"
+        )
+        conn.commit()
+        task_id = kb.create_task(
+            conn, title="fresh", assignee="dev", board="strict-collision"
+        )
+        task = kb.get_task(conn, task_id)
+
+    assert task_id == "t_fresh"
+    assert task.workspace_path == str(repo / ".worktrees" / "t_fresh")
+
+
+def test_strict_task_worktree_board_refuses_tampered_shared_checkout_at_dispatch(
+    kanban_home, tmp_path, all_assignees_spawnable
+):
+    """Claim-time validation closes races and manual DB edits after creation."""
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+    kb.create_board(
+        "strict-dispatch",
+        default_workdir=str(repo),
+        strict_task_worktrees=True,
+    )
+    spawned = []
+
+    with kb.connect(board="strict-dispatch") as conn:
+        task_id = kb.create_task(
+            conn,
+            title="tampered",
+            assignee="dev",
+            board="strict-dispatch",
+        )
+        conn.execute(
+            "UPDATE tasks SET workspace_kind='dir', workspace_path=? WHERE id=?",
+            (str(repo), task_id),
+        )
+        conn.commit()
+        result = kb.dispatch_once(
+            conn,
+            board="strict-dispatch",
+            spawn_fn=lambda task, workspace: spawned.append((task.id, workspace)),
+        )
+        task = kb.get_task(conn, task_id)
+
+    assert spawned == []
+    assert result.auto_blocked == [task_id]
+    assert task.status == "blocked"
+    assert "strict_task_worktrees" in (task.last_failure_error or "")
+
+
 def test_create_task_without_workspace_no_default_stays_none(kanban_home):
     """Board without default_workdir → create_task without workspace_path → stays None."""
     kb.create_board("empty-board")
